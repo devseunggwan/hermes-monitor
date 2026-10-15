@@ -107,8 +107,17 @@ def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
         plan = None
     status, windows = normalized["status"], normalized.get("windows", [])
     exhausted_until = _epoch(metadata.get("exhausted_until"))
-    if status == "n/a" and exhausted_until is not None:
-        # No live reading, but Hermes benched this account on a quota 429 until a known reset.
+    stale_since = _epoch(metadata.get("stale_since"))
+    read_at, benched_at = _value(metadata, "read_at"), _value(metadata, "benched_at")
+    if isinstance(read_at, (int, float)) and isinstance(benched_at, (int, float)):
+        # Both times known: the held reading is superseded only if it was taken before the bench.
+        superseded = read_at < benched_at
+    else:
+        superseded = stale_since is not None
+    if exhausted_until is not None and (status == "n/a" or superseded):
+        # Hermes benched this account on a quota 429 until a known reset, and the held figures
+        # predate that bench (or there are none). A reading taken after the bench wins, even cached.
+        stale_since = None
         status, windows = "exhausted", [{"label": "limit", "used_percent": 100.0, "reset_at": exhausted_until}]
     result = {
         "account_label": label,
@@ -118,7 +127,6 @@ def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
         "windows": windows,
         "balance": normalized.get("balance"),
     }
-    stale_since = _epoch(metadata.get("stale_since"))
     if stale_since is not None and status == "ok":
         result["stale_since"] = stale_since
     profile = metadata.get("profile")

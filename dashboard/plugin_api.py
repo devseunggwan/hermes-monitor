@@ -328,6 +328,12 @@ def _known_unreadable(snapshot: Any) -> bool:
     )
 
 
+def _read_at(provider: str, entry_id: str | None) -> float | None:
+    """When the figures held for this entry were read from the usage API, if any are held."""
+    cached = _last_good.get(f"{provider}:{entry_id}") if entry_id is not None else None
+    return cached[0] if cached is not None else None
+
+
 def _remember(key: str | None, result: Any) -> tuple[Any, int | None]:
     """Store a good *result*, or substitute the last good one; returns ``(result, stale_since)``."""
     now = time.time()
@@ -402,6 +408,8 @@ async def _collect_usage_from_snapshots(
                 "source": results[index][0],
                 "stale_since": results[index][1],
                 "exhausted_until": snapshot.exhausted_until,
+                "benched_at": snapshot.benched_at,
+                "read_at": _read_at(provider, snapshot.entry_id),
             }
             for index, snapshot in enumerate(snapshots)
         ],
@@ -604,6 +612,7 @@ class _PoolEntrySnapshot:
     provider: str
     exhausted_until: int | None = None
     dead: bool = False
+    benched_at: float | None = None
 
 
 def _claude_code_token() -> str:
@@ -670,6 +679,7 @@ def _snapshot_from_row(provider: str, row: dict[str, Any], memo: dict[str, str] 
         provider=provider,
         exhausted_until=_exhausted_until(row, time.time()),
         dead=row.get("last_status") == "dead",
+        benched_at=float(row["last_status_at"]) if isinstance(row.get("last_status_at"), (int, float)) else None,
     )
 
 

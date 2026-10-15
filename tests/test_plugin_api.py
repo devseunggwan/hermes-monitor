@@ -960,6 +960,39 @@ def test_secret_scope_helpers_degrade_without_agent_package():
         plugin_api._reset_secret_scope(scope_token)  # must not raise
 
 
+def test_bench_outranks_stale_figures_but_not_a_live_reading():
+    future = NOW + 3600
+    base = {"account_label": "spent", "active": False, "source": _usage_snapshot(), "exhausted_until": future}
+
+    def render(account):
+        source = {"pool_size": 1, "accounts": [account]}
+        return plugin_api.build_quotas_response({"anthropic": source}, now=NOW)["providers"][0]["accounts"][0]
+
+    stale = render(dict(base, stale_since=NOW - 600))
+    assert stale["status"] == "exhausted" and "stale_since" not in stale
+    assert stale["windows"] == [{"label": "limit", "used_percent": 100.0, "reset_at": future}]
+
+    live = render(base)
+    assert live["status"] == "ok" and [w["label"] for w in live["windows"]] == ["5h", "week"]
+
+    before_bench = render(dict(base, read_at=NOW - 60, benched_at=NOW - 30))
+    assert before_bench["status"] == "exhausted"
+    after_bench = render(dict(base, read_at=NOW - 10, benched_at=NOW - 30))
+    assert after_bench["status"] == "ok"
+    assert "read_at" not in after_bench and "benched_at" not in after_bench
+
+    stale_after_bench = render(dict(base, read_at=NOW - 10, benched_at=NOW - 30, stale_since=NOW - 10))
+    assert stale_after_bench["status"] == "ok" and stale_after_bench["stale_since"] == NOW - 10
+
+
+def test_read_at_tracks_the_held_reading():
+    assert plugin_api._read_at("anthropic", "a") is None
+    plugin_api._remember("anthropic:a", _usage_snapshot())
+    read_at = plugin_api._read_at("anthropic", "a")
+    assert read_at is not None and abs(read_at - plugin_api.time.time()) < 5
+    assert plugin_api._snapshot_from_row("anthropic", {"id": "a", "last_status_at": 123.5}).benched_at == 123.5
+
+
 def test_default_assignee_reads_the_root_session_store():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
