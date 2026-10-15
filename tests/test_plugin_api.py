@@ -980,6 +980,9 @@ def test_bench_outranks_stale_figures_but_not_a_live_reading():
     assert after_bench["status"] == "ok"
     assert "read_at" not in after_bench and "benched_at" not in after_bench
 
+    stale_after_bench = render(dict(base, read_at=NOW - 10, benched_at=NOW - 30, stale_since=NOW - 10))
+    assert stale_after_bench["status"] == "ok" and stale_after_bench["stale_since"] == NOW - 10
+
 
 def test_read_at_tracks_the_held_reading():
     assert plugin_api._read_at("anthropic", "a") is None
