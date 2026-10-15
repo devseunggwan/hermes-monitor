@@ -852,7 +852,8 @@ def test_cross_profile_reuses_one_fetch_per_unique_credential():
     claude = _result_provider(plugin_api.build_quotas_response(sources, now=NOW), "claude")
 
     # Three profiles share one credential store: each credential must be fetched once, not once per profile.
-    assert calls == [("anthropic", "token-a"), ("anthropic", "token-b")]
+    # Fetches run concurrently, so their order is not part of the contract.
+    assert sorted(calls) == [("anthropic", "token-a"), ("anthropic", "token-b")]
     assert [account["account_label"] for account in claude["accounts"]] == ["primary", "backup"]
     assert [account["profile"] for account in claude["accounts"]] == ["default", "default"]
     assert claude["pool_size"] == 2
@@ -989,6 +990,39 @@ def test_borrowed_claude_code_row_reads_its_token_read_only():
         snapshot = plugin_api._snapshot_from_row("anthropic", row)
     assert snapshot.access_token == "borrowed-token"
     assert snapshot.refresh_token is None
+
+
+def test_claude_code_login_is_read_once_per_collection():
+    row = {"id": "cc", "label": "claude_code", "source": "claude_code", "auth_type": "oauth"}
+    reads = []
+
+    def read_creds():
+        reads.append(1)
+        return {"accessToken": "borrowed-token"}
+
+    module = SimpleNamespace(read_claude_code_credentials=read_creds, is_claude_code_token_valid=lambda _: True)
+    memo = {}
+    with patch.object(plugin_api.importlib, "import_module", return_value=module):
+        tokens = [plugin_api._snapshot_from_row("anthropic", row, memo).access_token for _ in range(6)]
+    assert tokens == ["borrowed-token"] * 6 and len(reads) == 1
+
+
+def test_cross_profile_collection_shares_one_memo_off_the_event_loop():
+    seen = []
+
+    def fake_snapshot_pool(credential_module, provider, home_path, *, own=False, memo=None):
+        import threading
+        seen.append((id(memo), threading.current_thread() is threading.main_thread()))
+        return []
+
+    profiles = [("default", Path("/tmp/a")), ("one", Path("/tmp/b")), ("two", Path("/tmp/c"))]
+    with patch.object(plugin_api.importlib, "import_module", return_value=SimpleNamespace()), patch.object(
+        plugin_api, "_snapshot_pool_for_profile", fake_snapshot_pool
+    ):
+        asyncio.run(plugin_api._collect_usage_provider_cross_profile("anthropic", profiles, "Claude"))
+    assert len(seen) == 3
+    assert len({memo_id for memo_id, _ in seen}) == 1
+    assert not any(on_main for _, on_main in seen)
 
 
 def test_expired_borrowed_claude_code_token_is_skipped_not_refreshed():
