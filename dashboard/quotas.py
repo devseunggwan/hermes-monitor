@@ -105,14 +105,22 @@ def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
     plan = _value(source, "plan")
     if not isinstance(plan, str) or "@" in plan or len(plan) > 80:
         plan = None
+    status, windows = normalized["status"], normalized.get("windows", [])
+    exhausted_until = _epoch(metadata.get("exhausted_until"))
+    if status == "n/a" and exhausted_until is not None:
+        # No live reading, but Hermes benched this account on a quota 429 until a known reset.
+        status, windows = "exhausted", [{"label": "limit", "used_percent": 100.0, "reset_at": exhausted_until}]
     result = {
         "account_label": label,
         "plan": plan,
         "active": bool(metadata.get("active")),
-        "status": normalized["status"],
-        "windows": normalized.get("windows", []),
+        "status": status,
+        "windows": windows,
         "balance": normalized.get("balance"),
     }
+    stale_since = _epoch(metadata.get("stale_since"))
+    if stale_since is not None and status == "ok":
+        result["stale_since"] = stale_since
     profile = metadata.get("profile")
     if isinstance(profile, str) and profile.strip() and "@" not in profile and len(profile) <= 64:
         result["profile"] = profile.strip()

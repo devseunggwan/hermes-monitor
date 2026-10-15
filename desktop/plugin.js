@@ -44,7 +44,7 @@ const ID = 'hermes-monitor'
 
 // Polling cadences (ms). Never below 10s.
 const WORKER_INTERVAL_MS = 10_000
-const QUOTA_INTERVAL_MS = 300_000
+const QUOTA_INTERVAL_MS = 60_000
 
 // Traffic-light colors for the worker states. Mid-saturation hues that stay
 // legible on both the light and dark themes (bars + status dots).
@@ -90,11 +90,13 @@ function pad2(n) {
   return String(n).padStart(2, '0')
 }
 
-/** epoch seconds -> local "HH:MM"; null/undefined/garbage -> "n/a". */
+/** epoch seconds -> local "HH:MM" today, "MM/DD HH:MM" otherwise; garbage -> "n/a". */
 function formatResetTime(epoch) {
   if (!Number.isFinite(epoch)) return 'n/a'
   const d = new Date(epoch * 1000)
-  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+  const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+  if (d.toDateString() === new Date().toDateString()) return time
+  return `${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ${time}`
 }
 
 function formatDuration(totalSeconds) {
@@ -136,7 +138,7 @@ function formatBalance(balance) {
 }
 
 /**
- * Provider/account status is "ok" | "n/a". Anything else (a legacy payload with
+ * Provider/account status is "ok" | "exhausted" | "n/a". Anything else (a legacy payload with
  * no status field at all) counts as usable, so an older backend still renders
  * its numbers instead of collapsing to "n/a".
  */
@@ -534,7 +536,7 @@ function renderWindowDetail(win, key) {
       }, 'pct'),
       jsx('span', {
         className: 'text-right text-(--ui-text-quaternary)',
-        style: { width: '4.5rem', flex: '0 0 4.5rem' },
+        style: { width: '7rem', flex: '0 0 7rem', whiteSpace: 'nowrap' },
         children: win.reset_at != null ? `reset ${formatResetTime(win.reset_at)}` : 'n/a'
       }, 'reset')
     ]
@@ -577,6 +579,8 @@ function accountView(account, index) {
     profile: profile || null,
     active: a.active === true,
     ok: statusOk(a.status),
+    exhausted: a.status === 'exhausted',
+    staleSince: Number.isFinite(a.stale_since) ? a.stale_since : null,
     // Non-object window entries are dropped here: a malformed payload must never
     // throw while the statusbar is rendering.
     windows: Array.isArray(a.windows) ? a.windows.filter(win => win && typeof win === 'object') : [],
@@ -662,6 +666,13 @@ function renderAccountRow(raw, index, providerIndex) {
             style: { lineHeight: 1.3, whiteSpace: 'nowrap' },
             children: `plan ${account.plan}`
           }, 'plan')
+        : null,
+      account.exhausted || account.staleSince != null
+        ? jsx('span', {
+            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+            style: { lineHeight: 1.3, whiteSpace: 'nowrap' },
+            children: account.exhausted ? '· exhausted' : `· cached ${formatResetTime(account.staleSince)}`
+          }, 'state')
         : null,
       account.active
         ? jsx('span', {
