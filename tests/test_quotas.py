@@ -295,6 +295,34 @@ def test_pace_is_taken_at_the_read_time_of_a_reused_reading():
     assert window["pace"] == {"expected_percent": 40.0, "exhausts_at": read_at + 4800}
 
 
+def test_a_window_read_at_full_marks_the_account_exhausted_and_keeps_the_figures():
+    # Hermes has not benched this account, but the reading itself shows the weekly limit hit.
+    snapshot = _Snapshot([_Window("Current session", 0.0, NOW + 3600), _Window("Current week", 100.0, NOW + 86_400)])
+
+    account = _account(snapshot)
+
+    assert account["status"] == "exhausted"
+    assert [(w["label"], w["used_percent"]) for w in account["windows"]] == [("5h", 0.0), ("week", 100.0)]
+    assert all("pace" not in window for window in account["windows"])
+
+
+def test_held_figures_at_full_read_exhausted_not_cached():
+    snapshot = _Snapshot([_Window("Current session", 100.0, NOW + 600), _Window("Current week", 40.0, NOW + 86_400)])
+
+    account = _account(snapshot, stale_since=NOW - 300)
+
+    assert account["status"] == "exhausted" and "stale_since" not in account
+
+
+def test_a_full_window_past_its_reset_does_not_mark_the_account_exhausted():
+    # Held figures from before the reset: the window has since emptied, so they only read as cached.
+    snapshot = _Snapshot([_Window("Current session", 100.0, NOW - 60), _Window("Current week", 40.0, NOW + 86_400)])
+
+    account = _account(snapshot, stale_since=NOW - 7200)
+
+    assert account["status"] == "ok" and account["stale_since"] == NOW - 7200
+
+
 def test_weekly_exhausted_account_keeps_session_at_zero_and_week_full():
     until = NOW + 2 * 86_400
 

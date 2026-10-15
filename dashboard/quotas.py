@@ -181,6 +181,15 @@ def _generic(source: Any, provider_id: str, label: str) -> dict[str, Any]:
     return {"id": provider_id, "label": label, "status": "ok", "windows": normalized}
 
 
+def _limit_reached(windows: list[dict[str, Any]], now: int | None) -> bool:
+    """A window at 100% that has not reset yet (or whose reset is unknown)."""
+    return any(
+        window["used_percent"] >= 100
+        and (window.get("reset_at") is None or now is None or window["reset_at"] > now)
+        for window in windows
+    )
+
+
 def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> dict[str, Any]:
     metadata = raw if isinstance(raw, Mapping) and "source" in raw else {"source": raw, "account_label": "default", "active": True}
     source = metadata.get("source")
@@ -205,6 +214,11 @@ def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> di
         # predate that bench (or there are none). A reading taken after the bench wins, even cached.
         stale_since = None
         status, windows = "exhausted", _exhausted_windows(normalized["id"], exhausted_until, now, windows, benched_at)
+    if status == "ok" and _limit_reached(windows, now):
+        # A window read at 100% is a hit limit whether or not Hermes has benched the account; usage
+        # cannot fall before that window resets, so even held figures still tell it.
+        stale_since = None
+        status = "exhausted"
     result = {
         "account_label": label,
         "plan": plan,
