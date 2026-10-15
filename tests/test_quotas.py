@@ -285,6 +285,16 @@ def test_pace_is_omitted_for_providers_without_published_window_lengths():
     assert all("window_seconds" not in window and "pace" not in window for window in windows)
 
 
+def test_pace_is_taken_at_the_read_time_of_a_reused_reading():
+    # Read 2 h into a 5 h window at 60%, reused 100 s later: projected from the read, not from now.
+    read_at = NOW - 100
+    snapshot = _Snapshot([_Window("Session", 60.0, read_at + 3 * 3600)])
+
+    window = _account(snapshot, "openai-codex", read_at=read_at)["windows"][0]
+
+    assert window["pace"] == {"expected_percent": 40.0, "exhausts_at": read_at + 4800}
+
+
 def test_pace_is_omitted_for_cached_and_exhausted_accounts():
     cached = _account(_hermes_claude(), stale_since=NOW - 600)
     exhausted = _account(None, exhausted_until=NOW + 3600)

@@ -163,9 +163,11 @@ def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> di
         "windows": windows,
         "balance": normalized.get("balance"),
     }
-    # Pace extrapolates the reading to now, so it is left out for figures held from an earlier read.
+    # Pace is taken at the moment the figures were read: a reading reused inside the refetch interval
+    # is older than now. Figures held after a failed read (stale) get no pace at all.
     if status == "ok" and stale_since is None and now is not None:
-        result["windows"] = [_with_pace(window, now) for window in windows]
+        sampled_at = int(read_at) if isinstance(read_at, (int, float)) and read_at <= now else now
+        result["windows"] = [_with_pace(window, sampled_at) for window in windows]
     if stale_since is not None and status == "ok":
         result["stale_since"] = stale_since
     profile = metadata.get("profile")
