@@ -15,6 +15,8 @@ ONE_WEEK_S = 7 * 86400
 # Published Codex window lengths, keyed by normalized label: agent.account_usage labels Codex
 # windows "Session" / "Weekly" by their limit_window_seconds. Other providers carry no such contract.
 _CODEX_WINDOW_SECONDS = {"session": FIVE_HOURS_S, "weekly": ONE_WEEK_S}
+# A bench's reset and the hit window's own reset come from separate responses; allow for drift.
+RESET_MATCH_TOLERANCE_S = 15 * 60
 # The first slice of a window extrapolates from too little usage to mean anything.
 PACE_MIN_ELAPSED_FRACTION = 0.05
 
@@ -78,25 +80,45 @@ def _with_pace(window: dict[str, Any], now: int) -> dict[str, Any]:
 _EXHAUSTED_ROWS = {"claude": ("5h", "week"), "codex": ("Session", "Weekly")}
 
 
-def _exhausted_windows(provider_id: str, until: int, now: int | None) -> list[dict[str, Any]]:
+def _hit_window_seconds(until: int, now: int, held: list[dict[str, Any]]) -> int | None:
+    """Length of the window whose limit Hermes benched the account on, or ``None`` when unknown.
+
+    A bench resetting more than five hours out can only be the weekly limit. Closer than that, either
+    window fits, so the pre-bench reading decides: the window whose own reset matches the bench's.
+    """
+    if until - now > FIVE_HOURS_S:
+        return ONE_WEEK_S
+    matches = {
+        window.get("window_seconds")
+        for window in held
+        if isinstance(window.get("reset_at"), int) and abs(window["reset_at"] - until) <= RESET_MATCH_TOLERANCE_S
+    }
+    return matches.pop() if len(matches) == 1 else None
+
+
+def _exhausted_windows(
+    provider_id: str, until: int, now: int | None, held: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     """Rows for an account Hermes benched until *until* when no later reading is held.
 
-    The bench's reset says which limit was hit: within five hours it is the session window, else the
-    weekly one. A weekly-exhausted account cannot spend its session window, so that row reads 0%; a
-    session-exhausted account's weekly figure is unknown without a reading, so it carries none.
+    A weekly-exhausted account cannot spend its session window, so that row reads 0%; a
+    session-exhausted account's weekly figure is unknown without a reading, so it carries none. When
+    the limit that was hit cannot be told, neither row claims a figure and both show the bench's reset.
     """
     labels = _EXHAUSTED_ROWS.get(provider_id)
     if labels is None or now is None:
         return [{"label": "limit", "used_percent": 100.0, "reset_at": until}]
     session, week = labels
-    if until - now <= FIVE_HOURS_S:
-        return [
-            {"label": session, "used_percent": 100.0, "reset_at": until, "window_seconds": FIVE_HOURS_S},
-            {"label": week, "used_percent": None, "reset_at": None, "window_seconds": ONE_WEEK_S},
-        ]
+    hit = _hit_window_seconds(until, now, held)
+    if hit == ONE_WEEK_S:
+        session_row, week_row = (0.0, None), (100.0, until)
+    elif hit == FIVE_HOURS_S:
+        session_row, week_row = (100.0, until), (None, None)
+    else:
+        session_row, week_row = (None, until), (None, until)
     return [
-        {"label": session, "used_percent": 0.0, "reset_at": None, "window_seconds": FIVE_HOURS_S},
-        {"label": week, "used_percent": 100.0, "reset_at": until, "window_seconds": ONE_WEEK_S},
+        {"label": session, "used_percent": session_row[0], "reset_at": session_row[1], "window_seconds": FIVE_HOURS_S},
+        {"label": week, "used_percent": week_row[0], "reset_at": week_row[1], "window_seconds": ONE_WEEK_S},
     ]
 
 
@@ -180,7 +202,7 @@ def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> di
         # Hermes benched this account on a quota 429 until a known reset, and the held figures
         # predate that bench (or there are none). A reading taken after the bench wins, even cached.
         stale_since = None
-        status, windows = "exhausted", _exhausted_windows(normalized["id"], exhausted_until, now)
+        status, windows = "exhausted", _exhausted_windows(normalized["id"], exhausted_until, now, windows)
     result = {
         "account_label": label,
         "plan": plan,

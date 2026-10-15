@@ -970,9 +970,10 @@ def test_bench_outranks_stale_figures_but_not_a_live_reading():
 
     stale = render(dict(base, stale_since=NOW - 600))
     assert stale["status"] == "exhausted" and "stale_since" not in stale
+    # Neither held window resets with the bench, so neither row claims a figure.
     assert stale["windows"] == [
-        {"label": "5h", "used_percent": 100.0, "reset_at": future, "window_seconds": 18_000},
-        {"label": "week", "used_percent": None, "reset_at": None, "window_seconds": 604_800},
+        {"label": "5h", "used_percent": None, "reset_at": future, "window_seconds": 18_000},
+        {"label": "week", "used_percent": None, "reset_at": future, "window_seconds": 604_800},
     ]
 
     live = render(base)

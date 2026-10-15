@@ -307,18 +307,38 @@ def test_weekly_exhausted_account_keeps_session_at_zero_and_week_full():
         ]
 
 
-def test_session_exhausted_account_keeps_session_full_and_week_unknown():
-    until = NOW + 3600
+def _held(session_reset, week_reset):
+    return _Snapshot([_Window("Current session", 80.0, session_reset), _Window("Current week", 90.0, week_reset)])
 
-    account = _account(None, exhausted_until=until)
+
+def test_bench_within_five_hours_matching_the_held_session_reset_is_session_limited():
+    until = NOW + 3600
+    account = _account(_held(until + 60, NOW + 3 * 86_400), exhausted_until=until, stale_since=NOW - 600)
 
     assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
         ("5h", 100.0, until), ("week", None, None),
     ]
 
 
-def test_exhausted_account_at_exactly_five_hours_is_session_limited():
-    assert _account(None, exhausted_until=NOW + 18_000)["windows"][0]["used_percent"] == 100.0
+def test_bench_within_five_hours_matching_the_held_week_reset_is_week_limited():
+    # The weekly reset is 1 h away, so the reset alone cannot tell the two limits apart.
+    until = NOW + 3600
+    account = _account(_held(NOW + 7200, until), exhausted_until=until, read_at=NOW - 900, benched_at=NOW - 300)
+
+    assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
+        ("5h", 0.0, None), ("week", 100.0, until),
+    ]
+
+
+def test_bench_within_five_hours_without_a_matching_reading_claims_no_figure():
+    until = NOW + 18_000  # the boundary still counts as within five hours
+    for account in (
+        _account(None, exhausted_until=until),
+        _account(_held(NOW + 600, NOW + 3 * 86_400), exhausted_until=until, stale_since=NOW - 600),
+    ):
+        assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
+            ("5h", None, until), ("week", None, until),
+        ]
 
 
 def test_exhausted_generic_provider_keeps_a_single_limit_row():
