@@ -74,6 +74,32 @@ def _with_pace(window: dict[str, Any], now: int) -> dict[str, Any]:
     return {**window, "pace": pace} if pace is not None else window
 
 
+# Display labels of the five-hour and weekly rows, for providers whose quota is exactly those two windows.
+_EXHAUSTED_ROWS = {"claude": ("5h", "week"), "codex": ("Session", "Weekly")}
+
+
+def _exhausted_windows(provider_id: str, until: int, now: int | None) -> list[dict[str, Any]]:
+    """Rows for an account Hermes benched until *until* when no later reading is held.
+
+    The bench's reset says which limit was hit: within five hours it is the session window, else the
+    weekly one. A weekly-exhausted account cannot spend its session window, so that row reads 0%; a
+    session-exhausted account's weekly figure is unknown without a reading, so it carries none.
+    """
+    labels = _EXHAUSTED_ROWS.get(provider_id)
+    if labels is None or now is None:
+        return [{"label": "limit", "used_percent": 100.0, "reset_at": until}]
+    session, week = labels
+    if until - now <= FIVE_HOURS_S:
+        return [
+            {"label": session, "used_percent": 100.0, "reset_at": until, "window_seconds": FIVE_HOURS_S},
+            {"label": week, "used_percent": None, "reset_at": None, "window_seconds": ONE_WEEK_S},
+        ]
+    return [
+        {"label": session, "used_percent": 0.0, "reset_at": None, "window_seconds": FIVE_HOURS_S},
+        {"label": week, "used_percent": 100.0, "reset_at": until, "window_seconds": ONE_WEEK_S},
+    ]
+
+
 def _windows(snapshot: Any) -> list[Any]:
     raw = _value(snapshot, "windows", [])
     if isinstance(raw, Mapping):
@@ -154,7 +180,7 @@ def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> di
         # Hermes benched this account on a quota 429 until a known reset, and the held figures
         # predate that bench (or there are none). A reading taken after the bench wins, even cached.
         stale_since = None
-        status, windows = "exhausted", [{"label": "limit", "used_percent": 100.0, "reset_at": exhausted_until}]
+        status, windows = "exhausted", _exhausted_windows(normalized["id"], exhausted_until, now)
     result = {
         "account_label": label,
         "plan": plan,
