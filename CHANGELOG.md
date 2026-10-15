@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Quota windows show pace: an elapsed-time marker on each bar, an orange bar when usage at the current rate runs out before the reset, and the projected run-out time in the menu.
 - Fixed borrowed credentials (`claude_code`, `env:*`) always showing `n/a`: their secret is resolved read-only inside the profile scope; an expired Claude Code token is skipped, never refreshed.
 - Providers Hermes cannot read usage for (no fetcher, or DeepSeek without a key) are no longer listed as permanent `n/a` rows.
 - Accounts benched for quota exhaustion show `exhausted` with the bench's reset time instead of `n/a`, and the active marker follows the first account that is not benched.

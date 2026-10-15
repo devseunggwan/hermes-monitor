@@ -5,7 +5,9 @@
  *   1. Worker  — animated spinner + count of running kanban cards, colored by
  *                the worst worker state (loop > stalled > active).
  *   2. Quote   — one compact group per provider reported by the backend, with
- *                its own usage bars / remaining balance, colored by threshold.
+ *                its own usage bars / remaining balance, colored by threshold
+ *                and raised to orange while a window is on pace to run out
+ *                before its reset.
  *                The provider set is dynamic (1..N): nothing here is keyed on a
  *                provider id, the shape of each entry decides how it renders.
  *
@@ -84,6 +86,24 @@ function quotaColor(pct) {
   if (pct > 90) return RED
   if (pct >= 75) return ORANGE
   return GREEN
+}
+
+/** Epoch at which the window runs out at its rate so far, when that is before its reset; else null. */
+function exhaustsAt(win) {
+  const value = win?.pace?.exhausts_at
+  return Number.isFinite(value) ? value : null
+}
+
+/** Share of the window already elapsed (0..100), when the backend could tell; else null. */
+function expectedPct(win) {
+  const value = win?.pace?.expected_percent
+  return Number.isFinite(value) ? clampPct(value) : null
+}
+
+/** Threshold color, raised to at least orange while the window is on pace to run out before reset. */
+function windowColor(win, pct) {
+  const base = quotaColor(pct)
+  return base === GREEN && exhaustsAt(win) !== null ? ORANGE : base
 }
 
 function pad2(n) {
@@ -408,7 +428,7 @@ function renderWindowBar(win) {
                 bottom: 0,
                 left: 0,
                 width: `${pct}%`,
-                backgroundColor: quotaColor(pct)
+                backgroundColor: windowColor(win, pct)
               }
             })
           : null
@@ -510,6 +530,7 @@ function buildProviderChipNodes(providers) {
 function renderWindowDetail(win, key) {
   const hasPct = Number.isFinite(win.used_percent)
   const pct = clampPct(win.used_percent)
+  const expected = expectedPct(win)
   return jsxs('div', {
     className: 'w-full',
     style: { ...FOOTER_ROW, display: 'flex', gap: '0.5rem', width: '100%', paddingLeft: '0.875rem' },
@@ -521,13 +542,29 @@ function renderWindowDetail(win, key) {
       }, 'label'),
       jsx('span', {
         className: 'overflow-hidden rounded-sm bg-(--ui-stroke-secondary)',
-        style: { height: '0.5rem', minWidth: '5rem', flex: '1 1 auto' },
-        children: hasPct
-          ? jsx('span', {
-              className: 'block h-full rounded-sm',
-              style: { width: `${pct}%`, backgroundColor: quotaColor(pct) }
-            })
-          : null
+        style: { position: 'relative', height: '0.5rem', minWidth: '5rem', flex: '1 1 auto' },
+        children: [
+          hasPct
+            ? jsx('span', {
+                className: 'block h-full rounded-sm',
+                style: { width: `${pct}%`, backgroundColor: windowColor(win, pct) }
+              }, 'fill')
+            : null,
+          // Even-pace marker: where usage would sit if spread evenly over the window.
+          expected !== null
+            ? jsx('span', {
+                title: `${Math.round(expected)}% of the window elapsed`,
+                style: {
+                  position: 'absolute',
+                  top: 0,
+                  bottom: 0,
+                  left: `calc(${expected}% - 1px)`,
+                  width: '2px',
+                  backgroundColor: 'var(--ui-text-tertiary)'
+                }
+              }, 'pace')
+            : null
+        ]
       }, 'bar'),
       jsx('span', {
         className: 'text-right tabular-nums text-(--ui-text-secondary)',
@@ -549,6 +586,15 @@ function naLine(key) {
     className: 'text-(--ui-text-quaternary)',
     style: { paddingLeft: '0.875rem', lineHeight: 1.4 },
     children: 'n/a'
+  }, key)
+}
+
+/** Warning under a window that runs out at its rate so far before it resets. */
+function paceLine(win, key) {
+  return jsx('div', {
+    className: 'text-[0.625rem]',
+    style: { paddingLeft: '5.375rem', lineHeight: 1.3, color: ORANGE, whiteSpace: 'nowrap' },
+    children: `on pace to run out ~${formatResetTime(exhaustsAt(win))}`
   }, key)
 }
 
@@ -691,7 +737,10 @@ function renderAccountRow(raw, index, providerIndex) {
   if (!account.ok) {
     lines.push(naLine('nok'))
   } else {
-    account.windows.forEach((win, wi) => lines.push(renderWindowDetail(win, `window-${wi}`)))
+    account.windows.forEach((win, wi) => {
+      lines.push(renderWindowDetail(win, `window-${wi}`))
+      if (exhaustsAt(win) !== null) lines.push(paceLine(win, `pace-${wi}`))
+    })
     if (balanceAmount(account.balance) !== null) lines.push(balanceLine(account.balance, 'balance'))
     if (lines.length === 0) lines.push(naLine('empty'))
   }
