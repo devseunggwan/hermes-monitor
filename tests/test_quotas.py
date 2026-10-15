@@ -295,6 +295,68 @@ def test_pace_is_taken_at_the_read_time_of_a_reused_reading():
     assert window["pace"] == {"expected_percent": 40.0, "exhausts_at": read_at + 4800}
 
 
+def test_weekly_exhausted_account_keeps_session_at_zero_and_week_full():
+    until = NOW + 2 * 86_400
+
+    for provider, labels in (("anthropic", ("5h", "week")), ("openai-codex", ("Session", "Weekly"))):
+        account = _account(None, provider, exhausted_until=until, benched_at=NOW - 18_000)
+
+        assert account["status"] == "exhausted"
+        assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
+            (labels[0], 0.0, None), (labels[1], 100.0, until),
+        ]
+
+
+def test_weekly_exhausted_session_reads_no_figure_until_a_full_session_has_passed():
+    until = NOW + 2 * 86_400
+
+    for metadata in ({"benched_at": NOW - 17_999}, {}):
+        account = _account(None, exhausted_until=until, **metadata)
+
+        assert [(w["label"], w["used_percent"]) for w in account["windows"]] == [("5h", None), ("week", 100.0)]
+
+
+def _held(session_reset, week_reset):
+    return _Snapshot([_Window("Current session", 80.0, session_reset), _Window("Current week", 90.0, week_reset)])
+
+
+def test_bench_within_five_hours_matching_the_held_session_reset_is_session_limited():
+    until = NOW + 3600
+    account = _account(_held(until + 60, NOW + 3 * 86_400), exhausted_until=until, stale_since=NOW - 600)
+
+    assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
+        ("5h", 100.0, until), ("week", None, None),
+    ]
+
+
+def test_bench_within_five_hours_matching_the_held_week_reset_is_week_limited():
+    # The weekly reset is 1 h away, so the reset alone cannot tell the two limits apart.
+    until = NOW + 3600
+    account = _account(_held(NOW + 7200, until), exhausted_until=until, read_at=NOW - 900, benched_at=NOW - 300)
+
+    # Benched 5 min ago: pre-bench session usage may remain, so that row carries no figure.
+    assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
+        ("5h", None, None), ("week", 100.0, until),
+    ]
+
+
+def test_bench_within_five_hours_without_a_matching_reading_claims_no_figure():
+    until = NOW + 18_000  # the boundary still counts as within five hours
+    for account in (
+        _account(None, exhausted_until=until),
+        _account(_held(NOW + 600, NOW + 3 * 86_400), exhausted_until=until, stale_since=NOW - 600),
+    ):
+        assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
+            ("5h", None, until), ("week", None, until),
+        ]
+
+
+def test_exhausted_generic_provider_keeps_a_single_limit_row():
+    account = _account(None, "opencode-zen", exhausted_until=NOW + 86_400)
+
+    assert account["windows"] == [{"label": "limit", "used_percent": 100.0, "reset_at": NOW + 86_400}]
+
+
 def test_pace_is_omitted_for_cached_and_exhausted_accounts():
     cached = _account(_hermes_claude(), stale_since=NOW - 600)
     exhausted = _account(None, exhausted_until=NOW + 3600)

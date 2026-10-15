@@ -80,7 +80,7 @@ Credentials stay in the backend and are never returned to the Desktop plugin. Th
 
 To aggregate quotas across profiles, the backend reads the credential store (`auth.json`) of every Hermes profile — the default home and each named profile under `profiles/` — one profile at a time. Each read is strictly read-only.
 
-- Active and non-active profiles are never mutated, refreshed, or persisted to during quota reads. Their accounts are read into immutable snapshots and only usage requests are issued against those snapshots; an expired token is never refreshed. An account Hermes benched on a quota 429 shows `exhausted` with the bench's reset time, and a failed read reuses that account's last good figures (marked `cached`) for up to six hours.
+- Active and non-active profiles are never mutated, refreshed, or persisted to during quota reads. Their accounts are read into immutable snapshots and only usage requests are issued against those snapshots; an expired token is never refreshed. An account Hermes benched on a quota 429 shows `exhausted` with the bench's reset time. Claude and Codex accounts keep their five-hour and weekly rows: the limit that was hit reads 100%, a weekly-exhausted account's five-hour row reads 0% once five hours have passed since the bench, and a row the monitor cannot tell reads `n/a`. Other providers show a single `limit` row. A failed read reuses that account's last good figures (marked `cached`) for up to six hours.
 - No secret from one profile is ever copied into another profile's credential store.
 
 No profile names, absolute paths, tokens, or other personal data leave the backend.

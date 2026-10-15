@@ -970,7 +970,11 @@ def test_bench_outranks_stale_figures_but_not_a_live_reading():
 
     stale = render(dict(base, stale_since=NOW - 600))
     assert stale["status"] == "exhausted" and "stale_since" not in stale
-    assert stale["windows"] == [{"label": "limit", "used_percent": 100.0, "reset_at": future}]
+    # Neither held window resets with the bench, so neither row claims a figure.
+    assert stale["windows"] == [
+        {"label": "5h", "used_percent": None, "reset_at": future, "window_seconds": 18_000},
+        {"label": "week", "used_percent": None, "reset_at": future, "window_seconds": 604_800},
+    ]
 
     live = render(base)
     assert live["status"] == "ok" and [w["label"] for w in live["windows"]] == ["5h", "week"]
@@ -1091,10 +1095,14 @@ def test_exhausted_row_reports_hermes_bench_until_its_reset():
     assert plugin_api._snapshot_from_row("anthropic", past).exhausted_until is None
 
     source = {"pool_size": 1, "accounts": [{"account_label": "spent", "active": False, "source": None,
-                                             "exhausted_until": future}]}
+                                             "exhausted_until": future, "benched_at": NOW - 86_400}]}
     account = plugin_api.build_quotas_response({"anthropic": source}, now=NOW)["providers"][0]["accounts"][0]
     assert account["status"] == "exhausted"
-    assert account["windows"] == [{"label": "limit", "used_percent": 100.0, "reset_at": future}]
+    # The bench ends far beyond NOW, so the weekly limit was hit.
+    assert account["windows"] == [
+        {"label": "5h", "used_percent": 0.0, "reset_at": None, "window_seconds": 18_000},
+        {"label": "week", "used_percent": 100.0, "reset_at": future, "window_seconds": 604_800},
+    ]
 
 
 def test_failed_read_falls_back_to_last_good_flagged_stale():
