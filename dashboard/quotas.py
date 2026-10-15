@@ -12,14 +12,9 @@ _SAFE_FAILURE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,59}")
 
 FIVE_HOURS_S = 5 * 3600
 ONE_WEEK_S = 7 * 86400
-# Published window lengths, keyed by normalized label: agent.account_usage names Claude windows
-# "Current session" / "Current week" and Codex windows "Session" / "Weekly".
-_WINDOW_SECONDS = {
-    "five_hour": FIVE_HOURS_S, "5_hour": FIVE_HOURS_S, "5h": FIVE_HOURS_S,
-    "current_session": FIVE_HOURS_S, "session": FIVE_HOURS_S,
-    "seven_day": ONE_WEEK_S, "7_day": ONE_WEEK_S, "week": ONE_WEEK_S, "weekly": ONE_WEEK_S,
-    "current_week": ONE_WEEK_S,
-}
+# Published Codex window lengths, keyed by normalized label: agent.account_usage labels Codex
+# windows "Session" / "Weekly" by their limit_window_seconds. Other providers carry no such contract.
+_CODEX_WINDOW_SECONDS = {"session": FIVE_HOURS_S, "weekly": ONE_WEEK_S}
 # The first slice of a window extrapolates from too little usage to mean anything.
 PACE_MIN_ELAPSED_FRACTION = 0.05
 
@@ -45,7 +40,7 @@ def _label_key(value: Any) -> str:
     return str(value or "").lower().replace("-", "_").replace(" ", "_")
 
 
-def _window(raw: Any, label: str | None = None) -> dict[str, Any] | None:
+def _window(raw: Any, label: str | None = None, seconds: int | None = None) -> dict[str, Any] | None:
     source_label = _value(raw, "label")
     used = _value(raw, "used_percent")
     try:
@@ -53,7 +48,6 @@ def _window(raw: Any, label: str | None = None) -> dict[str, Any] | None:
     except (TypeError, ValueError, OverflowError):
         return None
     window = {"label": label or str(source_label or ""), "used_percent": percent, "reset_at": _epoch(_value(raw, "reset_at"))}
-    seconds = _WINDOW_SECONDS.get(_label_key(source_label))
     if seconds is not None:
         window["window_seconds"] = seconds
     return window
@@ -94,7 +88,7 @@ def _claude(source: Any) -> dict[str, Any]:
     # agent.account_usage labels Claude windows "Current session" (five_hour) and "Current week" (seven_day)
     five = next((item for key, item in indexed.items() if key in {"five_hour", "5_hour", "5h", "current_session", "session"}), None)
     week = next((item for key, item in indexed.items() if key in {"seven_day", "7_day", "week", "weekly", "current_week"}), None)
-    normalized = [_window(five, "5h"), _window(week, "week")]
+    normalized = [_window(five, "5h", FIVE_HOURS_S), _window(week, "week", ONE_WEEK_S)]
     if any(item is None for item in normalized):
         return {"id": "claude", "label": "Claude", "status": "n/a", "windows": []}
     return {"id": "claude", "label": "Claude", "status": "ok", "windows": normalized}
@@ -103,7 +97,7 @@ def _claude(source: Any) -> dict[str, Any]:
 def _codex(source: Any) -> dict[str, Any]:
     if source is None or isinstance(source, BaseException):
         return {"id": "codex", "label": "Codex", "status": "n/a", "windows": []}
-    normalized = [_window(item) for item in _windows(source)]
+    normalized = [_window(item, seconds=_CODEX_WINDOW_SECONDS.get(_label_key(_value(item, "label")))) for item in _windows(source)]
     if not normalized or any(item is None for item in normalized):
         return {"id": "codex", "label": "Codex", "status": "n/a", "windows": []}
     return {"id": "codex", "label": "Codex", "status": "ok", "windows": normalized}

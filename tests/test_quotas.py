@@ -276,6 +276,15 @@ def test_pace_at_a_near_zero_percentage_does_not_overflow():
     assert _account(snapshot, "openai-codex")["windows"][0]["pace"] == {"expected_percent": 80.0, "exhausts_at": None}
 
 
+def test_pace_is_omitted_for_providers_without_published_window_lengths():
+    # A plugin provider may call a window "Weekly" with no guarantee it spans seven days.
+    snapshot = _Snapshot([_Window("Weekly", 60.0, NOW + 3 * 3600), _Window("Session", 60.0, NOW + 3600)])
+
+    windows = _account(snapshot, "opencode-zen")["windows"]
+
+    assert all("window_seconds" not in window and "pace" not in window for window in windows)
+
+
 def test_pace_is_omitted_for_cached_and_exhausted_accounts():
     cached = _account(_hermes_claude(), stale_since=NOW - 600)
     exhausted = _account(None, exhausted_until=NOW + 3600)
