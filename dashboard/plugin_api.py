@@ -309,6 +309,19 @@ def _recent(key: str | None) -> tuple[Any, int | None] | None:
     return None
 
 
+def _known_unreadable(snapshot: Any) -> bool:
+    """An account a read can only 401 on: revoked (Hermes marked it dead), or benched with an
+    expired token that Hermes will not refresh until the bench lifts."""
+    if snapshot.dead:
+        return True
+    expires_at_ms = snapshot.expires_at_ms
+    return (
+        snapshot.exhausted_until is not None
+        and expires_at_ms is not None
+        and expires_at_ms <= time.time() * 1000
+    )
+
+
 def _remember(key: str | None, result: Any) -> tuple[Any, int | None]:
     """Store a good *result*, or substitute the last good one; returns ``(result, stale_since)``."""
     now = time.time()
@@ -330,6 +343,8 @@ async def _snapshot_fetch(provider: str, snapshot: _PoolEntrySnapshot, shared: d
         return shared[key]
     cache_key = f"{provider}:{key}" if key is not None else None
     result = _recent(cache_key)
+    if result is None and _known_unreadable(snapshot):
+        result = _remember(cache_key, None)
     if result is None:
         live = (
             await _limited_call(_fetch_account_usage, provider, snapshot.access_token, False)
@@ -580,6 +595,7 @@ class _PoolEntrySnapshot:
     expires_at_ms: int | None
     provider: str
     exhausted_until: int | None = None
+    dead: bool = False
 
 
 def _borrowed_token(provider: str, source: str) -> str:
@@ -634,6 +650,7 @@ def _snapshot_from_row(provider: str, row: dict[str, Any]) -> _PoolEntrySnapshot
         expires_at_ms=int(expires_at_ms) if isinstance(expires_at_ms, (int, float)) else None,
         provider=provider,
         exhausted_until=_exhausted_until(row, time.time()),
+        dead=row.get("last_status") == "dead",
     )
 
 

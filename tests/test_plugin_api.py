@@ -1036,6 +1036,32 @@ def test_each_account_is_read_at_most_once_per_interval_and_backs_off_after_fail
         assert len(calls) == 2 and backoff[0] == value
 
 
+def test_benched_account_with_expired_token_is_not_called():
+    future = int(plugin_api.time.time()) + 3600
+    expired_ms = (int(plugin_api.time.time()) - 60) * 1000
+    valid_ms = (int(plugin_api.time.time()) + 3600) * 1000
+    spent = plugin_api._PoolEntrySnapshot("a", "spent", 0, "manual", "oauth", "t1", None, expired_ms, "anthropic", future)
+    live = plugin_api._PoolEntrySnapshot("b", "spent-live", 1, "manual", "oauth", "t2", None, valid_ms, "anthropic", future)
+    calls = []
+
+    def fetch(*args):
+        calls.append(args)
+        return _usage_snapshot()
+
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=fetch):
+        assert asyncio.run(plugin_api._snapshot_fetch("anthropic", spent, None)) == (None, None)
+        assert asyncio.run(plugin_api._snapshot_fetch("anthropic", live, None))[0] == _usage_snapshot()
+    assert [call[1] for call in calls] == ["t2"]
+
+
+def test_dead_account_is_not_called():
+    row = {"id": "d", "label": "revoked", "access_token": "t", "last_status": "dead"}
+    snapshot = plugin_api._snapshot_from_row("anthropic", row)
+    assert snapshot.dead is True
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=AssertionError("called")):
+        assert asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None)) == (None, None)
+
+
 def test_active_account_is_first_one_not_exhausted():
     future = int(plugin_api.time.time()) + 3600
     snapshots = [
