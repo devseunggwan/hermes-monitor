@@ -63,8 +63,14 @@ def test_claude_ok_maps_five_hour_and_seven_day_windows():
         "label": "Claude",
         "status": "ok",
         "windows": [
-            {"label": "5h", "used_percent": 12.5, "reset_at": NOW + 10},
-            {"label": "week", "used_percent": 33.0, "reset_at": None},
+            {
+                "label": "5h",
+                "used_percent": 12.5,
+                "reset_at": NOW + 10,
+                "window_seconds": 18_000,
+                "pace": {"expected_percent": 99.9, "exhausts_at": None},
+            },
+            {"label": "week", "used_percent": 33.0, "reset_at": None, "window_seconds": 604_800},
         ],
     }
 
@@ -197,6 +203,81 @@ def test_provider_without_failures_has_no_failures_key():
     )
 
     assert "failures" not in claude
+
+
+class _Window:
+    """Shape of agent.account_usage.AccountUsageWindow (attributes, not a mapping)."""
+
+    def __init__(self, label, used_percent, reset_at):
+        self.label, self.used_percent, self.reset_at = label, used_percent, reset_at
+
+
+class _Snapshot:
+    def __init__(self, windows):
+        self.windows, self.plan = tuple(windows), None
+
+
+def _hermes_claude():
+    return _Snapshot([_Window("Current session", 20.0, NOW + 3600), _Window("Current week", 30.0, NOW + 86_400)])
+
+
+def _account(source, provider="anthropic", **metadata):
+    envelope = {"accounts": [{"account_label": "a", "active": True, "source": source, **metadata}]}
+    result = build_quotas_response({provider: envelope}, now=NOW)
+    return result["providers"][0]["accounts"][0]
+
+
+def test_hermes_claude_labels_carry_window_lengths_and_pace():
+    windows = _account(_hermes_claude())["windows"]
+
+    assert [(w["label"], w["window_seconds"]) for w in windows] == [("5h", 18_000), ("week", 604_800)]
+    # 4 h into the session at 20%: 5%/h reaches 100% after the reset in 1 h.
+    assert windows[0]["pace"] == {"expected_percent": 80.0, "exhausts_at": None}
+
+
+def test_pace_projects_exhaustion_before_reset():
+    # 2 h into a 5 h window at 60%: 30%/h leaves 40% for 80 min, well before the reset in 3 h.
+    snapshot = _Snapshot([_Window("Session", 60.0, NOW + 3 * 3600)])
+
+    window = _account(snapshot, "openai-codex")["windows"][0]
+
+    assert window["pace"] == {"expected_percent": 40.0, "exhausts_at": NOW + 4800}
+
+
+def test_pace_without_exhaustion_before_reset():
+    # 1 day into a week at 10%: the rate so far reaches 100% after the reset.
+    snapshot = _Snapshot([_Window("Weekly", 10.0, NOW + 6 * 86_400)])
+
+    window = _account(snapshot, "openai-codex")["windows"][0]
+
+    assert window["pace"] == {"expected_percent": 14.3, "exhausts_at": None}
+
+
+def test_pace_is_omitted_early_in_a_window_and_for_unknown_lengths():
+    snapshot = _Snapshot([
+        _Window("Session", 3.0, NOW + 18_000 - 600),  # 10 min into 5 h: under 5% elapsed
+        _Window("primary", 40.0, NOW + 3600),  # no published length
+        _Window("Weekly", 30.0, None),  # no reset time
+        _Window("Weekly", 30.0, NOW + 700_000),  # reset beyond the window length
+    ])
+
+    assert all("pace" not in window for window in _account(snapshot, "openai-codex")["windows"])
+
+
+def test_pace_at_zero_usage_never_projects_exhaustion():
+    snapshot = _Snapshot([_Window("Session", 0.0, NOW + 3600)])
+
+    assert _account(snapshot, "openai-codex")["windows"][0]["pace"] == {"expected_percent": 80.0, "exhausts_at": None}
+
+
+def test_pace_is_omitted_for_cached_and_exhausted_accounts():
+    cached = _account(_hermes_claude(), stale_since=NOW - 600)
+    exhausted = _account(None, exhausted_until=NOW + 3600)
+
+    assert cached["stale_since"] == NOW - 600
+    assert all("pace" not in window for window in cached["windows"])
+    assert exhausted["status"] == "exhausted"
+    assert all("pace" not in window for window in exhausted["windows"])
 
 
 def load_tests(loader, tests, pattern):

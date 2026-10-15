@@ -10,6 +10,19 @@ from typing import Any
 # Exception class names only: a raw message could carry a token, an absolute home path or a URL.
 _SAFE_FAILURE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,59}")
 
+FIVE_HOURS_S = 5 * 3600
+ONE_WEEK_S = 7 * 86400
+# Published window lengths, keyed by normalized label: agent.account_usage names Claude windows
+# "Current session" / "Current week" and Codex windows "Session" / "Weekly".
+_WINDOW_SECONDS = {
+    "five_hour": FIVE_HOURS_S, "5_hour": FIVE_HOURS_S, "5h": FIVE_HOURS_S,
+    "current_session": FIVE_HOURS_S, "session": FIVE_HOURS_S,
+    "seven_day": ONE_WEEK_S, "7_day": ONE_WEEK_S, "week": ONE_WEEK_S, "weekly": ONE_WEEK_S,
+    "current_week": ONE_WEEK_S,
+}
+# The first slice of a window extrapolates from too little usage to mean anything.
+PACE_MIN_ELAPSED_FRACTION = 0.05
+
 
 def _value(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, Mapping):
@@ -28,6 +41,10 @@ def _epoch(value: Any) -> int | None:
         return None
 
 
+def _label_key(value: Any) -> str:
+    return str(value or "").lower().replace("-", "_").replace(" ", "_")
+
+
 def _window(raw: Any, label: str | None = None) -> dict[str, Any] | None:
     source_label = _value(raw, "label")
     used = _value(raw, "used_percent")
@@ -35,7 +52,32 @@ def _window(raw: Any, label: str | None = None) -> dict[str, Any] | None:
         percent = float(used)
     except (TypeError, ValueError, OverflowError):
         return None
-    return {"label": label or str(source_label or ""), "used_percent": percent, "reset_at": _epoch(_value(raw, "reset_at"))}
+    window = {"label": label or str(source_label or ""), "used_percent": percent, "reset_at": _epoch(_value(raw, "reset_at"))}
+    seconds = _WINDOW_SECONDS.get(_label_key(source_label))
+    if seconds is not None:
+        window["window_seconds"] = seconds
+    return window
+
+
+def _pace(window: Mapping[str, Any], now: int) -> dict[str, Any] | None:
+    """Share of the window elapsed, and when usage at the rate so far runs out if before reset."""
+    seconds, reset_at, used = window.get("window_seconds"), window.get("reset_at"), window.get("used_percent")
+    if not isinstance(seconds, int) or not isinstance(reset_at, int) or not isinstance(used, float):
+        return None
+    elapsed = seconds - (reset_at - now)
+    if elapsed < seconds * PACE_MIN_ELAPSED_FRACTION or elapsed > seconds:
+        return None
+    pace: dict[str, Any] = {"expected_percent": round(elapsed / seconds * 100, 1), "exhausts_at": None}
+    if 0 < used < 100:
+        exhausts_at = now + int((100 - used) * elapsed / used)
+        if exhausts_at < reset_at:
+            pace["exhausts_at"] = exhausts_at
+    return pace
+
+
+def _with_pace(window: dict[str, Any], now: int) -> dict[str, Any]:
+    pace = _pace(window, now)
+    return {**window, "pace": pace} if pace is not None else window
 
 
 def _windows(snapshot: Any) -> list[Any]:
@@ -48,7 +90,7 @@ def _windows(snapshot: Any) -> list[Any]:
 def _claude(source: Any) -> dict[str, Any]:
     if source is None or isinstance(source, BaseException):
         return {"id": "claude", "label": "Claude", "status": "n/a", "windows": []}
-    indexed = {str(_value(item, "label", "")).lower().replace("-", "_").replace(" ", "_"): item for item in _windows(source)}
+    indexed = {_label_key(_value(item, "label", "")): item for item in _windows(source)}
     # agent.account_usage labels Claude windows "Current session" (five_hour) and "Current week" (seven_day)
     five = next((item for key, item in indexed.items() if key in {"five_hour", "5_hour", "5h", "current_session", "session"}), None)
     week = next((item for key, item in indexed.items() if key in {"seven_day", "7_day", "week", "weekly", "current_week"}), None)
@@ -95,7 +137,7 @@ def _generic(source: Any, provider_id: str, label: str) -> dict[str, Any]:
     return {"id": provider_id, "label": label, "status": "ok", "windows": normalized}
 
 
-def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
+def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> dict[str, Any]:
     metadata = raw if isinstance(raw, Mapping) and "source" in raw else {"source": raw, "account_label": "default", "active": True}
     source = metadata.get("source")
     normalized = transform(source)
@@ -127,6 +169,9 @@ def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
         "windows": windows,
         "balance": normalized.get("balance"),
     }
+    # Pace extrapolates the reading to now, so it is left out for figures held from an earlier read.
+    if status == "ok" and stale_since is None and now is not None:
+        result["windows"] = [_with_pace(window, now) for window in windows]
     if stale_since is not None and status == "ok":
         result["stale_since"] = stale_since
     profile = metadata.get("profile")
@@ -135,10 +180,10 @@ def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
     return result
 
 
-def _provider(source: Any, transform: Any, *, key_source: bool = False) -> dict[str, Any]:
+def _provider(source: Any, transform: Any, *, key_source: bool = False, now: int | None = None) -> dict[str, Any]:
     envelope = source if isinstance(source, Mapping) and isinstance(source.get("accounts"), list) else None
     raw_accounts = envelope["accounts"] if envelope is not None else [source]
-    accounts = [_account(raw, transform, index) for index, raw in enumerate(raw_accounts)]
+    accounts = [_account(raw, transform, index, now) for index, raw in enumerate(raw_accounts)]
     active = next((account for account in accounts if account["active"]), None)
     identity = transform(None)
     result = {
@@ -187,7 +232,7 @@ def build_quotas_response(sources: Mapping[str, Any], *, now: int) -> dict[str, 
             )
             transform = lambda value, item=provider_id, name=label[:80]: _generic(value, item, name)
             include_key_source = False
-        providers.append(_provider(source, transform, key_source=include_key_source))
+        providers.append(_provider(source, transform, key_source=include_key_source, now=int(now)))
     return {
         "generated_at": int(now),
         "providers": providers,
