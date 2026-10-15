@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Each Claude account row shows the email it is signed in with, so pool labels that hide the same login (or one label shared by two logins) can be told apart. OAuth accounts read it from Anthropic's OAuth profile endpoint once a day per account; the borrowed Claude Code login reads it from Claude Code's own config, with no network call.
 - Accounts that share a label in one provider show their pool entry id (`<label> · <id>`), so the rows can be told apart.
 - An account whose reading shows a window at 100% (not yet reset) shows `exhausted` instead of `ok`, even before Hermes benches it.
 - A refresh button at the top right of the Quotas menu re-reads every account now, skipping the two-minute refetch interval but not the backoff after a failed read; it rests for 30 seconds after each click.

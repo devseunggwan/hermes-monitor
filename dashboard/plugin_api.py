@@ -379,6 +379,69 @@ async def _snapshot_fetch(
     return result
 
 
+ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+# A login's email does not change, so one profile call per account a day is enough.
+EMAIL_TTL_S = 24 * 3600
+EMAIL_FAILURE_BACKOFF_S = 30 * 60
+_emails: dict[str, tuple[float, str]] = {}
+_email_failures: dict[str, float] = {}
+
+
+def _fetch_anthropic_email(token: str) -> str | None:
+    """Sign-in email of an Anthropic OAuth token; a read-only GET that never refreshes the token."""
+    request = urllib.request.Request(
+        ANTHROPIC_PROFILE_URL,
+        headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20", "Accept": "application/json"},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    account = body.get("account") if isinstance(body, dict) else None
+    email = account.get("email") if isinstance(account, dict) else None
+    return email if isinstance(email, str) else None
+
+
+def _claude_code_email() -> str | None:
+    """Email of the Claude Code login, from its own config file (no network call).
+
+    Read on every build: ``claude /login`` can switch the account at any time. The config sits in
+    ``CLAUDE_CONFIG_DIR`` when set (as Hermes resolves the Claude Code credentials), else the home.
+    """
+    override = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    path = Path(override).expanduser() / ".claude.json" if override else Path.home() / ".claude.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    account = config.get("oauthAccount") if isinstance(config, dict) else None
+    email = account.get("emailAddress") if isinstance(account, dict) else None
+    return email if isinstance(email, str) else None
+
+
+async def _account_email(provider: str, snapshot: _PoolEntrySnapshot) -> str | None:
+    """Email *snapshot*'s credential is signed in with, when the provider can tell it (Anthropic only)."""
+    if provider != "anthropic" or snapshot.dead:
+        return None
+    if snapshot.source == "claude_code":
+        return await _limited_call(_claude_code_email)
+    if not snapshot.access_token or snapshot.entry_id is None:
+        return None
+    key = f"{provider}:{snapshot.entry_id}"
+    now = time.time()
+    cached = _emails.get(key)
+    if cached is not None and now - cached[0] < EMAIL_TTL_S:
+        return cached[1]
+    if now - _email_failures.get(key, 0.0) < EMAIL_FAILURE_BACKOFF_S:
+        return cached[1] if cached is not None else None
+    email = await _limited_call(_fetch_anthropic_email, snapshot.access_token)
+    if email:
+        _emails[key] = (now, email)
+        return email
+    _email_failures[key] = now
+    # A failed re-read keeps the email already known: it cannot have changed.
+    return cached[1] if cached is not None else None
+
+
 async def _collect_usage_from_snapshots(
     provider: str,
     snapshots: list[_PoolEntrySnapshot],
@@ -401,6 +464,7 @@ async def _collect_usage_from_snapshots(
     )
     calls = [_snapshot_fetch(provider, snapshot, shared, force) for snapshot in snapshots]
     results = await asyncio.gather(*calls)
+    emails = await asyncio.gather(*(_account_email(provider, snapshot) for snapshot in snapshots))
     # Hermes skips benched and dead rows, so the account in use is the first one that is neither.
     active_index = next(
         (i for i, snapshot in enumerate(snapshots) if snapshot.exhausted_until is None and not snapshot.dead), 0
@@ -413,6 +477,7 @@ async def _collect_usage_from_snapshots(
             {
                 "entry_id": snapshot.entry_id,
                 "account_label": _safe_account_label(snapshot, index, secrets),
+                "account_email": emails[index],
                 "active": active and index == active_index,
                 "source": results[index][0],
                 "stale_since": results[index][1],

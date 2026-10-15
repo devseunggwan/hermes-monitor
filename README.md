@@ -68,13 +68,15 @@ Five-hour and weekly windows also carry a pace reading. The menu bar marks how m
 
 Accounts are collected from every Hermes profile (the default profile plus each named profile under `profiles/`), deduplicated, and labelled with the profile they come from (two accounts sharing a name also show their pool entry id), so a provider reports its accounts wherever they are configured.
 
+Each Claude account row also shows the email the account is signed in with, since a pool label is only the name given at login and can hide which login it is. An OAuth account's email comes from Anthropic's OAuth profile endpoint (`GET https://api.anthropic.com/api/oauth/profile`), read at most once a day per account (30 minutes after a failed read); the borrowed Claude Code login's email comes from Claude Code's own config file (`.claude.json` in `CLAUDE_CONFIG_DIR`, else the home directory). Other providers show no email.
+
 DeepSeek credentials are resolved from the process environment, the Hermes root `.env`, then the first profile `.env` containing `DEEPSEEK_API_KEY` in alphabetical profile order.
 
 ## Privacy
 
 The backend opens the local Kanban and worker session databases in read-only mode. It returns activity metadata only. Message content and tool arguments never reach the frontend; arguments are represented by hashes for loop detection.
 
-Credentials stay in the backend and are never returned to the Desktop plugin. The only external requests are the DeepSeek balance API call (`GET https://api.deepseek.com/user/balance`) and the account-usage API calls already used by Hermes for Claude and Codex. Hermes core may refresh an Anthropic token for the active profile near expiry, or a Codex token after an HTTP 401, rewriting only that profile's `auth.json`; quota reads themselves use immutable snapshots and never refresh credentials. Each external call has a 15-second timeout, quota results are cached for 60 seconds, and each account's usage is read at most every two minutes (five after a failed read).
+Credentials stay in the backend and are never returned to the Desktop plugin. The only external requests are the DeepSeek balance API call (`GET https://api.deepseek.com/user/balance`), the Anthropic OAuth profile call that reads each Claude account's email, and the account-usage API calls already used by Hermes for Claude and Codex. Hermes core may refresh an Anthropic token for the active profile near expiry, or a Codex token after an HTTP 401, rewriting only that profile's `auth.json`; quota reads themselves use immutable snapshots and never refresh credentials. Each external call has a 15-second timeout, quota results are cached for 60 seconds, and each account's usage is read at most every two minutes (five after a failed read).
 
 ### Which credential files are read
 
@@ -83,7 +85,7 @@ To aggregate quotas across profiles, the backend reads the credential store (`au
 - Active and non-active profiles are never mutated, refreshed, or persisted to during quota reads. Their accounts are read into immutable snapshots and only usage requests are issued against those snapshots; an expired token is never refreshed. An account Hermes benched on a quota 429 shows `exhausted` with the bench's reset time. Claude and Codex accounts keep their five-hour and weekly rows: the limit that was hit reads 100%, a weekly-exhausted account's five-hour row reads 0% once five hours have passed since the bench, and a row the monitor cannot tell reads `n/a`. Other providers show a single `limit` row. A reading with a window at 100% that has not reset also shows `exhausted`, with its figures as read; held figures count only with a known reset still ahead. A failed read reuses that account's last good figures (marked `cached`) for up to six hours.
 - No secret from one profile is ever copied into another profile's credential store.
 
-No profile names, absolute paths, tokens, or other personal data leave the backend.
+No profile names, absolute paths, tokens, or other personal data leave the backend, with one exception: each Claude account's sign-in email is sent to the local Desktop plugin so its row can show which login it is. It is displayed in the Quotas menu only and is never sent anywhere else.
 
 ## Development
 
