@@ -960,6 +960,20 @@ def test_secret_scope_helpers_degrade_without_agent_package():
         plugin_api._reset_secret_scope(scope_token)  # must not raise
 
 
+def test_workers_cache_expires_before_the_desktop_poll():
+    poll_s = 10  # desktop/plugin.js WORKER_INTERVAL_MS
+    assert plugin_api._workers_cache.ttl < poll_s
+    assert plugin_api._quotas_cache.ttl == 60
+
+    workers = plugin_api.TTLCache(plugin_api.WORKERS_CACHE_TTL_S)
+    workers.set({"count": 1}, now=0.0)
+    assert workers.get(now=poll_s) is None
+
+    quotas = plugin_api.TTLCache()
+    quotas.set({"providers": []}, now=0.0)
+    assert quotas.get(now=poll_s) == {"providers": []}
+
+
 def _claude_code_module(creds, valid):
     return SimpleNamespace(read_claude_code_credentials=lambda: creds, is_claude_code_token_valid=lambda _: valid)
 
