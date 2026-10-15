@@ -48,6 +48,9 @@ const ID = 'hermes-monitor'
 // Polling cadences (ms). Never below 10s.
 const WORKER_INTERVAL_MS = 10_000
 const QUOTA_INTERVAL_MS = 60_000
+// After a forced refresh the button rests this long: every click re-reads every account, and the
+// usage API answers bursts with a 429 that holds for minutes.
+const FORCE_COOLDOWN_MS = 30_000
 
 // Traffic-light colors for the worker states. Mid-saturation hues that stay
 // legible on both the light and dark themes (bars + status dots).
@@ -246,12 +249,21 @@ function useMonitor(ctx, path, intervalMs) {
     requestNow('fresh=1')
   }, [requestNow])
 
-  // Re-reads every account now (the backend still honours its failure backoff).
+  // Epoch ms until which a forced refresh is refused; 0 when the button is ready.
+  const [cooldownUntil, setCooldownUntil] = useState(0)
+  const cooldownTimer = useRef(null)
+
+  useEffect(() => () => clearTimeout(cooldownTimer.current), [])
+
+  // Re-reads every account now (the backend still honours its failure backoff), then rests.
   const refreshForce = useCallback(() => {
-    if (forcing) return
+    if (forcing || Date.now() < cooldownUntil) return
+    setCooldownUntil(Date.now() + FORCE_COOLDOWN_MS)
+    clearTimeout(cooldownTimer.current)
+    cooldownTimer.current = setTimeout(() => setCooldownUntil(0), FORCE_COOLDOWN_MS)
     setForcing(true)
     requestNow('force=1').finally(() => setForcing(false))
-  }, [forcing, requestNow])
+  }, [forcing, cooldownUntil, requestNow])
 
   const close = useCallback(() => {
     openRef.current = false
@@ -263,7 +275,7 @@ function useMonitor(ctx, path, intervalMs) {
   const failed = query.isError === true || query.isRefetchError === true || freshFailed
   const data = failed ? null : query.data
 
-  return { data, error: failed, refreshFresh, refreshForce, forcing, close }
+  return { data, error: failed, refreshFresh, refreshForce, forcing, cooldownUntil, close }
 }
 
 // -- shared chrome helpers ----------------------------------------------------
@@ -801,15 +813,22 @@ function buildProviderMenuNodes(providers) {
 
 /**
  * Small top-right button that re-reads every account now. A plain button, not a menu item, so the
- * menu stays open while the new figures replace the old ones.
+ * menu stays open while the new figures replace the old ones. It rests for FORCE_COOLDOWN_MS after
+ * each click.
  */
-function renderForceRefreshButton(onRefresh, busy, generatedAt) {
+function renderForceRefreshButton(onRefresh, busy, generatedAt, cooldownUntil = 0) {
   const updated = Number.isFinite(generatedAt) ? ` · updated ${formatClock(generatedAt)}` : ''
+  const cooling = !busy && Number.isFinite(cooldownUntil) && cooldownUntil > Date.now()
+  const blocked = busy || cooling
   return jsx('button', {
     type: 'button',
     'aria-label': 'Refresh quotas now',
-    title: busy ? 'Refreshing…' : `Refresh now${updated}`,
-    disabled: busy,
+    title: busy
+      ? 'Refreshing…'
+      : cooling
+        ? `Refresh again at ${formatClock(Math.ceil(cooldownUntil / 1000))}${updated}`
+        : `Refresh now${updated}`,
+    disabled: blocked,
     onClick: event => {
       event.preventDefault()
       event.stopPropagation()
@@ -828,8 +847,8 @@ function renderForceRefreshButton(onRefresh, busy, generatedAt) {
       padding: 0,
       border: 0,
       background: 'transparent',
-      cursor: busy ? 'default' : 'pointer',
-      opacity: busy ? 0.6 : 1,
+      cursor: blocked ? 'default' : 'pointer',
+      opacity: blocked ? 0.6 : 1,
       zIndex: 1
     },
     children: jsx(icons.RefreshCw, { className: busy ? 'size-3 animate-spin' : 'size-3' })
@@ -837,7 +856,7 @@ function renderForceRefreshButton(onRefresh, busy, generatedAt) {
 }
 
 function QuoteChip({ ctx }) {
-  const { data, error, refreshFresh, refreshForce, forcing, close } = useMonitor(ctx, '/quotas', QUOTA_INTERVAL_MS)
+  const { data, error, refreshFresh, refreshForce, forcing, cooldownUntil, close } = useMonitor(ctx, '/quotas', QUOTA_INTERVAL_MS)
 
   const providers = (Array.isArray(data?.providers) ? data.providers : []).filter(p => p && typeof p === 'object')
 
@@ -879,7 +898,7 @@ function QuoteChip({ ctx }) {
         side: 'top',
         sideOffset: 8,
         style: { minWidth: '20rem', position: 'relative' },
-        children: [renderForceRefreshButton(refreshForce, forcing, data?.generated_at), ...menuChildren]
+        children: [renderForceRefreshButton(refreshForce, forcing, data?.generated_at, cooldownUntil), ...menuChildren]
       })
     ]
   })
