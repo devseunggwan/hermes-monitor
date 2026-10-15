@@ -270,6 +270,12 @@ def test_pace_at_zero_usage_never_projects_exhaustion():
     assert _account(snapshot, "openai-codex")["windows"][0]["pace"] == {"expected_percent": 80.0, "exhausts_at": None}
 
 
+def test_pace_at_a_near_zero_percentage_does_not_overflow():
+    snapshot = _Snapshot([_Window("Session", 5e-324, NOW + 3600)])
+
+    assert _account(snapshot, "openai-codex")["windows"][0]["pace"] == {"expected_percent": 80.0, "exhausts_at": None}
+
+
 def test_pace_is_omitted_for_cached_and_exhausted_accounts():
     cached = _account(_hermes_claude(), stale_since=NOW - 600)
     exhausted = _account(None, exhausted_until=NOW + 3600)

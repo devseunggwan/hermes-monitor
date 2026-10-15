@@ -68,10 +68,10 @@ def _pace(window: Mapping[str, Any], now: int) -> dict[str, Any] | None:
     if elapsed < seconds * PACE_MIN_ELAPSED_FRACTION or elapsed > seconds:
         return None
     pace: dict[str, Any] = {"expected_percent": round(elapsed / seconds * 100, 1), "exhausts_at": None}
-    if 0 < used < 100:
-        exhausts_at = now + int((100 - used) * elapsed / used)
-        if exhausts_at < reset_at:
-            pace["exhausts_at"] = exhausts_at
+    remaining = reset_at - now
+    # Compared without dividing: a near-zero percentage would overflow the projected time.
+    if 0 < used < 100 and (100 - used) * elapsed < used * remaining:
+        pace["exhausts_at"] = now + int((100 - used) * elapsed / used)
     return pace
 
 
