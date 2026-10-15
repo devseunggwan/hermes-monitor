@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Accounts that share a label in one provider show their pool entry id (`<label> · <id>`), so the rows can be told apart.
 - An account whose reading shows a window at 100% (not yet reset) shows `exhausted` instead of `ok`, even before Hermes benches it.
 - A refresh button at the top right of the Quotas menu re-reads every account now, skipping the two-minute refetch interval but not the backoff after a failed read; it rests for 30 seconds after each click.
 - Exhausted Claude and Codex accounts keep their five-hour and weekly rows instead of collapsing into one `limit` row: the limit that was hit reads 100%, a weekly-exhausted account's five-hour row reads 0% once five hours have passed since the bench, and a row that cannot be told reads `n/a`.
