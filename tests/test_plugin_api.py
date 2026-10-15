@@ -974,6 +974,20 @@ def test_bench_outranks_stale_figures_but_not_a_live_reading():
     live = render(base)
     assert live["status"] == "ok" and [w["label"] for w in live["windows"]] == ["5h", "week"]
 
+    before_bench = render(dict(base, read_at=NOW - 60, benched_at=NOW - 30))
+    assert before_bench["status"] == "exhausted"
+    after_bench = render(dict(base, read_at=NOW - 10, benched_at=NOW - 30))
+    assert after_bench["status"] == "ok"
+    assert "read_at" not in after_bench and "benched_at" not in after_bench
+
+
+def test_read_at_tracks_the_held_reading():
+    assert plugin_api._read_at("anthropic", "a") is None
+    plugin_api._remember("anthropic:a", _usage_snapshot())
+    read_at = plugin_api._read_at("anthropic", "a")
+    assert read_at is not None and abs(read_at - plugin_api.time.time()) < 5
+    assert plugin_api._snapshot_from_row("anthropic", {"id": "a", "last_status_at": 123.5}).benched_at == 123.5
+
 
 def _claude_code_module(creds, valid):
     return SimpleNamespace(read_claude_code_credentials=lambda: creds, is_claude_code_token_valid=lambda _: valid)

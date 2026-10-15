@@ -108,9 +108,13 @@ def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
     status, windows = normalized["status"], normalized.get("windows", [])
     exhausted_until = _epoch(metadata.get("exhausted_until"))
     stale_since = _epoch(metadata.get("stale_since"))
-    if exhausted_until is not None and (status == "n/a" or stale_since is not None):
-        # No current reading, but Hermes benched this account on a quota 429 until a known reset;
-        # that bench is newer than any cached figures. A live reading still wins.
+    read_at, benched_at = _value(metadata, "read_at"), _value(metadata, "benched_at")
+    read_before_bench = (
+        isinstance(read_at, (int, float)) and isinstance(benched_at, (int, float)) and read_at < benched_at
+    )
+    if exhausted_until is not None and (status == "n/a" or stale_since is not None or read_before_bench):
+        # Hermes benched this account on a quota 429 until a known reset, and no reading taken
+        # after that bench is held: cached figures predate it. A reading newer than the bench wins.
         stale_since = None
         status, windows = "exhausted", [{"label": "limit", "used_percent": 100.0, "reset_at": exhausted_until}]
     result = {
