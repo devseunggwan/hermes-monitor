@@ -299,12 +299,21 @@ def test_weekly_exhausted_account_keeps_session_at_zero_and_week_full():
     until = NOW + 2 * 86_400
 
     for provider, labels in (("anthropic", ("5h", "week")), ("openai-codex", ("Session", "Weekly"))):
-        account = _account(None, provider, exhausted_until=until)
+        account = _account(None, provider, exhausted_until=until, benched_at=NOW - 18_000)
 
         assert account["status"] == "exhausted"
         assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
             (labels[0], 0.0, None), (labels[1], 100.0, until),
         ]
+
+
+def test_weekly_exhausted_session_reads_no_figure_until_a_full_session_has_passed():
+    until = NOW + 2 * 86_400
+
+    for metadata in ({"benched_at": NOW - 17_999}, {}):
+        account = _account(None, exhausted_until=until, **metadata)
+
+        assert [(w["label"], w["used_percent"]) for w in account["windows"]] == [("5h", None), ("week", 100.0)]
 
 
 def _held(session_reset, week_reset):
@@ -325,8 +334,9 @@ def test_bench_within_five_hours_matching_the_held_week_reset_is_week_limited():
     until = NOW + 3600
     account = _account(_held(NOW + 7200, until), exhausted_until=until, read_at=NOW - 900, benched_at=NOW - 300)
 
+    # Benched 5 min ago: pre-bench session usage may remain, so that row carries no figure.
     assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
-        ("5h", 0.0, None), ("week", 100.0, until),
+        ("5h", None, None), ("week", 100.0, until),
     ]
 
 

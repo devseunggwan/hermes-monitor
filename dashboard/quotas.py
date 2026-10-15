@@ -97,11 +97,12 @@ def _hit_window_seconds(until: int, now: int, held: list[dict[str, Any]]) -> int
 
 
 def _exhausted_windows(
-    provider_id: str, until: int, now: int | None, held: list[dict[str, Any]]
+    provider_id: str, until: int, now: int | None, held: list[dict[str, Any]], benched_at: Any = None
 ) -> list[dict[str, Any]]:
     """Rows for an account Hermes benched until *until* when no later reading is held.
 
-    A weekly-exhausted account cannot spend its session window, so that row reads 0%; a
+    A weekly-exhausted account cannot spend its session window, so once a full session has passed
+    since the bench that row reads 0% (before that, pre-bench usage may remain and it carries none); a
     session-exhausted account's weekly figure is unknown without a reading, so it carries none. When
     the limit that was hit cannot be told, neither row claims a figure and both show the bench's reset.
     """
@@ -111,7 +112,8 @@ def _exhausted_windows(
     session, week = labels
     hit = _hit_window_seconds(until, now, held)
     if hit == ONE_WEEK_S:
-        session_row, week_row = (0.0, None), (100.0, until)
+        drained = isinstance(benched_at, (int, float)) and now - benched_at >= FIVE_HOURS_S
+        session_row, week_row = (0.0 if drained else None, None), (100.0, until)
     elif hit == FIVE_HOURS_S:
         session_row, week_row = (100.0, until), (None, None)
     else:
@@ -202,7 +204,7 @@ def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> di
         # Hermes benched this account on a quota 429 until a known reset, and the held figures
         # predate that bench (or there are none). A reading taken after the bench wins, even cached.
         stale_since = None
-        status, windows = "exhausted", _exhausted_windows(normalized["id"], exhausted_until, now, windows)
+        status, windows = "exhausted", _exhausted_windows(normalized["id"], exhausted_until, now, windows, benched_at)
     result = {
         "account_label": label,
         "plan": plan,

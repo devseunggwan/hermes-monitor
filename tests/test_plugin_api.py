@@ -1095,7 +1095,7 @@ def test_exhausted_row_reports_hermes_bench_until_its_reset():
     assert plugin_api._snapshot_from_row("anthropic", past).exhausted_until is None
 
     source = {"pool_size": 1, "accounts": [{"account_label": "spent", "active": False, "source": None,
-                                             "exhausted_until": future}]}
+                                             "exhausted_until": future, "benched_at": NOW - 86_400}]}
     account = plugin_api.build_quotas_response({"anthropic": source}, now=NOW)["providers"][0]["accounts"][0]
     assert account["status"] == "exhausted"
     # The bench ends far beyond NOW, so the weekly limit was hit.
