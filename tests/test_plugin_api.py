@@ -141,7 +141,7 @@ def test_workers_endpoint_exact_shape_and_fresh_bypasses_cache():
 
 
 def test_quotas_endpoint_source_failure_is_nd_and_secret_free():
-    async def fake_sources():
+    async def fake_sources(force=False):
         return {"anthropic": RuntimeError(CANARY), "openai-codex": RuntimeError(CANARY), "deepseek": RuntimeError(CANARY)}
 
     with patch.object(plugin_api, "_collect_quota_sources", fake_sources), patch.object(plugin_api.time, "time", lambda: NOW):
@@ -1139,6 +1139,46 @@ def test_each_account_is_read_at_most_once_per_interval_and_backs_off_after_fail
         assert len(calls) == 2 and failed[0] == value and failed[1] is not None
         backoff = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
         assert len(calls) == 2 and backoff[0] == value
+
+
+def test_force_rereads_inside_the_refetch_interval_but_keeps_the_failure_backoff():
+    snapshot = plugin_api._PoolEntrySnapshot("a", "acct", 0, "manual", "oauth", "t1", None, None, "anthropic")
+    calls = []
+
+    def fetch(*args):
+        calls.append(args)
+        return _usage_snapshot(len(calls)) if len(calls) < 3 else None
+
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=fetch):
+        asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+        held = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+        assert len(calls) == 1 and held[0] == _usage_snapshot(1)
+
+        forced = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None, force=True))
+        assert len(calls) == 2 and forced == (_usage_snapshot(2), None)
+
+        failed = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None, force=True))
+        assert len(calls) == 3 and failed[0] == _usage_snapshot(2) and failed[1] is not None
+        backoff = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None, force=True))
+        assert len(calls) == 3 and backoff[0] == _usage_snapshot(2)
+
+
+def test_quotas_route_force_skips_the_payload_cache_and_reaches_the_collector():
+    received = []
+
+    async def collect(force=False):
+        received.append(force)
+        return {}
+
+    plugin_api._quotas_cache.clear()
+    with patch.object(plugin_api, "_collect_quota_sources", side_effect=collect):
+        asyncio.run(plugin_api.get_quotas(fresh=0, force=0))
+        asyncio.run(plugin_api.get_quotas(fresh=0, force=0))  # served from the payload cache
+        asyncio.run(plugin_api.get_quotas(fresh=0, force=1))
+        asyncio.run(plugin_api.get_quotas(fresh=1, force=0))
+    plugin_api._quotas_cache.clear()
+
+    assert received == [False, True, False]
 
 
 def test_benched_account_with_expired_token_is_not_called():

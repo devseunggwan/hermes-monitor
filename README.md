@@ -10,7 +10,7 @@ Hermes Monitor adds two compact items to the right side of the Hermes Desktop fo
 
 ![Footer](docs/footer.png)
 
-Open the Worker item to see each running card, its title, assignee, runtime, last activity, and a link to Kanban. Open the Quotas item for the full Claude, Codex, and DeepSeek details. Both menus request a fresh reading when opened.
+Open the Worker item to see each running card, its title, assignee, runtime, last activity, and a link to Kanban. Open the Quotas item for the full Claude, Codex, and DeepSeek details. Both menus request a fresh reading when opened. The refresh button at the top right of the Quotas menu re-reads every account at once, even one read within the last two minutes. An account whose last read failed still waits out its five-minute backoff.
 
 ## Requirements
 
