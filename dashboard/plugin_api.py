@@ -43,7 +43,7 @@ except ImportError:  # Loaded by file path by the Hermes plugin loader: no packa
 
 router = APIRouter()
 TIMEOUT_S = 15
-CACHE_TTL_S = 300
+CACHE_TTL_S = 60
 
 
 class TTLCache:
@@ -285,14 +285,37 @@ async def _collect_usage_provider(
     }
 
 
+# Last successful usage per pool entry. The usage endpoint answers bursts with 429 for minutes,
+# so a failed read falls back to the previous figures (flagged stale) instead of n/a.
+LAST_GOOD_MAX_AGE_S = 6 * 3600
+_last_good: dict[str, tuple[float, Any]] = {}
+
+
+def _remember(key: str | None, result: Any) -> tuple[Any, int | None]:
+    """Store a good *result*, or substitute the last good one; returns ``(result, stale_since)``."""
+    now = time.time()
+    if key is None:
+        return result, None
+    if result is not None:
+        _last_good[key] = (now, result)
+        return result, None
+    cached = _last_good.get(key)
+    if cached is None or now - cached[0] > LAST_GOOD_MAX_AGE_S:
+        return None, None
+    return cached[1], int(cached[0])
+
+
 async def _snapshot_fetch(provider: str, snapshot: _PoolEntrySnapshot, shared: dict[str, Any] | None) -> Any:
     """Fetch usage for one sibling snapshot entry; never refreshes the sibling's token."""
     key = snapshot.entry_id
     if shared is not None and key is not None and key in shared:
         return shared[key]
-    if not snapshot.access_token:
-        return None
-    result = await _limited_call(_fetch_account_usage, provider, snapshot.access_token, False)
+    result = (
+        await _limited_call(_fetch_account_usage, provider, snapshot.access_token, False)
+        if snapshot.access_token
+        else None
+    )
+    result = _remember(key, result)
     if shared is not None and key is not None:
         shared[key] = result
     return result
@@ -319,6 +342,8 @@ async def _collect_usage_from_snapshots(
     )
     calls = [_snapshot_fetch(provider, snapshot, shared) for snapshot in snapshots]
     results = await asyncio.gather(*calls)
+    # Hermes skips benched rows, so the account in use is the first one not exhausted.
+    active_index = next((i for i, snapshot in enumerate(snapshots) if snapshot.exhausted_until is None), 0)
     return {
         "pool_size": len(snapshots),
         "provider_label": label,
@@ -327,8 +352,10 @@ async def _collect_usage_from_snapshots(
             {
                 "entry_id": snapshot.entry_id,
                 "account_label": _safe_account_label(snapshot, index, secrets),
-                "active": active and index == 0,
-                "source": results[index],
+                "active": active and index == active_index,
+                "source": results[index][0],
+                "stale_since": results[index][1],
+                "exhausted_until": snapshot.exhausted_until,
             }
             for index, snapshot in enumerate(snapshots)
         ],
@@ -529,11 +556,43 @@ class _PoolEntrySnapshot:
     refresh_token: str | None
     expires_at_ms: int | None
     provider: str
+    exhausted_until: int | None = None
+
+
+def _borrowed_token(provider: str, source: str) -> str:
+    """Secret of a borrowed row, which Hermes persists without it; ``""`` when unavailable.
+
+    Must run inside the profile's home override + secret scope. Strictly read-only: an expired
+    Claude Code token is skipped, never refreshed (its refresh tokens are single-use, so a
+    refresh here would log Claude Code out) and nothing is written.
+    """
+    try:
+        if provider == "anthropic" and source == "claude_code":
+            credentials = importlib.import_module("agent.anthropic_credentials")
+            creds = credentials.read_claude_code_credentials()
+            if creds and credentials.is_claude_code_token_valid(creds):
+                return str(creds.get("accessToken") or "")
+        elif source.startswith("env:"):
+            return str(importlib.import_module("agent.secret_scope").get_secret(source[4:]) or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _exhausted_until(row: dict[str, Any], now: float) -> int | None:
+    """Reset epoch of a row Hermes benched for quota exhaustion, while that bench still holds."""
+    if row.get("last_status") != "exhausted":
+        return None
+    reset_at = row.get("last_error_reset_at")
+    if not isinstance(reset_at, (int, float)) or reset_at <= now:
+        return None
+    return int(reset_at)
 
 
 def _snapshot_from_row(provider: str, row: dict[str, Any]) -> _PoolEntrySnapshot:
     refresh_token = row.get("refresh_token")
     expires_at_ms = row.get("expires_at_ms")
+    source = str(row.get("source") or "")
 
     def _priority() -> int:
         try:
@@ -545,12 +604,13 @@ def _snapshot_from_row(provider: str, row: dict[str, Any]) -> _PoolEntrySnapshot
         entry_id=row.get("id") if isinstance(row.get("id"), str) else None,
         label=str(row.get("label") or ""),
         priority=_priority(),
-        source=str(row.get("source") or ""),
+        source=source,
         auth_type=str(row.get("auth_type") or ""),
-        access_token=str(row.get("access_token") or ""),
+        access_token=str(row.get("access_token") or "") or _borrowed_token(provider, source),
         refresh_token=refresh_token if isinstance(refresh_token, str) and refresh_token else None,
         expires_at_ms=int(expires_at_ms) if isinstance(expires_at_ms, (int, float)) else None,
         provider=provider,
+        exhausted_until=_exhausted_until(row, time.time()),
     )
 
 
@@ -571,21 +631,24 @@ def _snapshot_pool_for_profile(
     set_override, reset_override = _home_override_api()
     if not own and set_override is None:
         return None
+    def read() -> list[_PoolEntrySnapshot]:
+        # Built in scope: a borrowed row resolves its secret from this profile.
+        rows = read_credential_pool(provider)
+        if not isinstance(rows, list):
+            return []
+        return [_snapshot_from_row(provider, row) for row in rows if isinstance(row, dict)]
+
     secret_token = _install_secret_scope(home_path)
     try:
         if own:
-            rows = read_credential_pool(provider)
-        else:
-            token = set_override(str(home_path))
-            try:
-                rows = read_credential_pool(provider)
-            finally:
-                reset_override(token)
+            return read()
+        token = set_override(str(home_path))
+        try:
+            return read()
+        finally:
+            reset_override(token)
     finally:
         _reset_secret_scope(secret_token)
-    if not isinstance(rows, list):
-        return []
-    return [_snapshot_from_row(provider, row) for row in rows if isinstance(row, dict)]
 
 
 async def _collect_usage_provider_cross_profile(provider: str, profiles: list[tuple[str, Path]], label: str) -> dict[str, Any] | None:
@@ -665,6 +728,18 @@ async def _collect_usage_provider_cross_profile(provider: str, profiles: list[tu
     }
 
 
+def _reads_account_usage(provider: str, supported: set[str]) -> bool:
+    """Whether Hermes can read *provider*'s usage: a built-in fetcher or a profile usage hook."""
+    if provider in supported:
+        return True
+    try:
+        profile = importlib.import_module("providers").get_provider_profile(provider)
+        base_hook = importlib.import_module("providers.base").ProviderProfile.fetch_account_usage
+    except Exception:
+        return False
+    return profile is not None and type(profile).fetch_account_usage is not base_hook
+
+
 async def _collect_quota_sources() -> dict[str, Any]:
     credential_module = importlib.import_module("agent.credential_pool")
     account_usage_module = importlib.import_module("agent.account_usage")
@@ -675,6 +750,9 @@ async def _collect_quota_sources() -> dict[str, Any]:
 
     providers: list[tuple[str, str]] = []
     for provider in sorted(set(registry) | supported):
+        # A provider Hermes cannot read usage for would be a permanent n/a row.
+        if not (deepseek_key if provider == "deepseek" else _reads_account_usage(provider, supported)):
+            continue
         config = registry.get(provider)
         if config is not None and _is_local_only_provider(config):
             continue

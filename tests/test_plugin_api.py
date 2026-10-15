@@ -12,6 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from dashboard import plugin_api
 
 try:
@@ -265,6 +267,13 @@ class _FakePool:
         return self._active
 
 
+@pytest.fixture(autouse=True)
+def _clear_last_good():
+    plugin_api._last_good.clear()
+    yield
+    plugin_api._last_good.clear()
+
+
 def _pool_entry(identifier, label, token, priority):
     return SimpleNamespace(
         id=identifier,
@@ -370,7 +379,7 @@ def test_usage_collection_never_selects_an_expiring_token():
     assert envelope["accounts"][0]["source"]["windows"]
 
 
-def test_dynamic_provider_enumeration_excludes_local_only_and_keeps_unknown_as_nd():
+def test_dynamic_provider_enumeration_excludes_local_only_and_providers_without_usage():
     entries = {
         "anthropic": _pool_entry("a", "primary", "anthropic-token", 0),
         "openai-codex": _pool_entry("c", "primary", "codex-token", 0),
@@ -403,9 +412,9 @@ def test_dynamic_provider_enumeration_excludes_local_only_and_keeps_unknown_as_n
         sources = asyncio.run(plugin_api._collect_quota_sources())
     result = plugin_api.build_quotas_response(sources, now=NOW)
 
-    assert [provider["id"] for provider in result["providers"]] == ["claude", "codex", "mystery"]
-    assert [provider["status"] for provider in result["providers"]] == ["ok", "ok", "n/a"]
-    assert result["providers"][2]["account_label"] == "primary"
+    # "mystery" has no usage fetcher, so it could only ever render n/a: it is dropped.
+    assert [provider["id"] for provider in result["providers"]] == ["claude", "codex"]
+    assert [provider["status"] for provider in result["providers"]] == ["ok", "ok"]
     assert "mystery-token" not in json.dumps(result)
 
 
@@ -946,6 +955,73 @@ def test_secret_scope_helpers_degrade_without_agent_package():
         scope_token = plugin_api._install_secret_scope(Path("/tmp/not-hermes"))
         assert scope_token is None
         plugin_api._reset_secret_scope(scope_token)  # must not raise
+
+
+def _claude_code_module(creds, valid):
+    return SimpleNamespace(read_claude_code_credentials=lambda: creds, is_claude_code_token_valid=lambda _: valid)
+
+
+def test_borrowed_claude_code_row_reads_its_token_read_only():
+    row = {"id": "cc", "label": "claude_code", "source": "claude_code", "auth_type": "oauth"}
+    creds = {"accessToken": "borrowed-token", "refreshToken": "never-used"}
+
+    def fake_import(name):
+        assert name == "agent.anthropic_credentials"
+        return _claude_code_module(creds, True)
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import):
+        snapshot = plugin_api._snapshot_from_row("anthropic", row)
+    assert snapshot.access_token == "borrowed-token"
+    assert snapshot.refresh_token is None
+
+
+def test_expired_borrowed_claude_code_token_is_skipped_not_refreshed():
+    row = {"id": "cc", "label": "claude_code", "source": "claude_code", "auth_type": "oauth"}
+    module = _claude_code_module({"accessToken": "expired-token"}, False)
+    with patch.object(plugin_api.importlib, "import_module", return_value=module):
+        snapshot = plugin_api._snapshot_from_row("anthropic", row)
+    assert snapshot.access_token == ""
+
+
+def test_exhausted_row_reports_hermes_bench_until_its_reset():
+    future = int(plugin_api.time.time()) + 3600
+    row = {"id": "x", "label": "spent", "access_token": "expired", "last_status": "exhausted",
+           "last_error_reset_at": float(future)}
+    assert plugin_api._snapshot_from_row("anthropic", row).exhausted_until == future
+    past = dict(row, last_error_reset_at=float(future - 7200))
+    assert plugin_api._snapshot_from_row("anthropic", past).exhausted_until is None
+
+    source = {"pool_size": 1, "accounts": [{"account_label": "spent", "active": False, "source": None,
+                                             "exhausted_until": future}]}
+    account = plugin_api.build_quotas_response({"anthropic": source}, now=NOW)["providers"][0]["accounts"][0]
+    assert account["status"] == "exhausted"
+    assert account["windows"] == [{"label": "limit", "used_percent": 100.0, "reset_at": future}]
+
+
+def test_failed_read_falls_back_to_last_good_flagged_stale():
+    good = _usage_snapshot()
+    assert plugin_api._remember("entry", good) == (good, None)
+    result, stale_since = plugin_api._remember("entry", None)
+    assert result is good and isinstance(stale_since, int)
+
+    plugin_api._last_good["entry"] = (plugin_api.time.time() - plugin_api.LAST_GOOD_MAX_AGE_S - 1, good)
+    assert plugin_api._remember("entry", None) == (None, None)
+
+    source = {"pool_size": 1, "accounts": [{"account_label": "a", "active": True, "source": good,
+                                             "stale_since": NOW}]}
+    account = plugin_api.build_quotas_response({"anthropic": source}, now=NOW)["providers"][0]["accounts"][0]
+    assert account["status"] == "ok" and account["stale_since"] == NOW
+
+
+def test_active_account_is_first_one_not_exhausted():
+    future = int(plugin_api.time.time()) + 3600
+    snapshots = [
+        plugin_api._PoolEntrySnapshot("a", "spent", 0, "manual", "oauth", "t1", None, None, "anthropic", future),
+        plugin_api._PoolEntrySnapshot("b", "live", 1, "manual", "oauth", "t2", None, None, "anthropic", None),
+    ]
+    with patch.object(plugin_api, "_fetch_account_usage", return_value=_usage_snapshot()):
+        envelope = asyncio.run(plugin_api._collect_usage_from_snapshots("anthropic", snapshots, "Claude", {}, active=True))
+    assert [account["active"] for account in envelope["accounts"]] == [False, True]
 
 
 def load_tests(loader, tests, pattern):

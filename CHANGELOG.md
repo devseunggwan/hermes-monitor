@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Fixed borrowed credentials (`claude_code`, `env:*`) always showing `n/a`: their secret is resolved read-only inside the profile scope; an expired Claude Code token is skipped, never refreshed.
+- Providers Hermes cannot read usage for (no fetcher, or DeepSeek without a key) are no longer listed as permanent `n/a` rows.
+- Accounts benched for quota exhaustion show `exhausted` with the bench's reset time instead of `n/a`, and the active marker follows the first account that is not benched.
+- A failed usage read (e.g. the endpoint's 429) falls back to the account's last good figures, marked `cached`, for up to six hours.
+- Reset times outside today include the date (`MM/DD HH:MM`).
+- Quotas refresh every 60 seconds (backend cache and footer poll were 5 minutes).
+
 ## 0.3.5
 
 - Security: quota reads now resolve the active Hermes profile as their own home and use immutable credential snapshots for every profile, including the active profile. The root home is still included as a read-only sibling when a named profile is active, preventing expired root credentials from being refreshed or copied into the active profile's `auth.json`.
