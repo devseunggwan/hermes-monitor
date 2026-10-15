@@ -107,8 +107,11 @@ def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
         plan = None
     status, windows = normalized["status"], normalized.get("windows", [])
     exhausted_until = _epoch(metadata.get("exhausted_until"))
-    if status == "n/a" and exhausted_until is not None:
-        # No live reading, but Hermes benched this account on a quota 429 until a known reset.
+    stale_since = _epoch(metadata.get("stale_since"))
+    if exhausted_until is not None and (status == "n/a" or stale_since is not None):
+        # No current reading, but Hermes benched this account on a quota 429 until a known reset;
+        # that bench is newer than any cached figures. A live reading still wins.
+        stale_since = None
         status, windows = "exhausted", [{"label": "limit", "used_percent": 100.0, "reset_at": exhausted_until}]
     result = {
         "account_label": label,
@@ -118,7 +121,6 @@ def _account(raw: Any, transform: Any, index: int) -> dict[str, Any]:
         "windows": windows,
         "balance": normalized.get("balance"),
     }
-    stale_since = _epoch(metadata.get("stale_since"))
     if stale_since is not None and status == "ok":
         result["stale_since"] = stale_since
     profile = metadata.get("profile")

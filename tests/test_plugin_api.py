@@ -959,6 +959,22 @@ def test_secret_scope_helpers_degrade_without_agent_package():
         plugin_api._reset_secret_scope(scope_token)  # must not raise
 
 
+def test_bench_outranks_stale_figures_but_not_a_live_reading():
+    future = NOW + 3600
+    base = {"account_label": "spent", "active": False, "source": _usage_snapshot(), "exhausted_until": future}
+
+    def render(account):
+        source = {"pool_size": 1, "accounts": [account]}
+        return plugin_api.build_quotas_response({"anthropic": source}, now=NOW)["providers"][0]["accounts"][0]
+
+    stale = render(dict(base, stale_since=NOW - 600))
+    assert stale["status"] == "exhausted" and "stale_since" not in stale
+    assert stale["windows"] == [{"label": "limit", "used_percent": 100.0, "reset_at": future}]
+
+    live = render(base)
+    assert live["status"] == "ok" and [w["label"] for w in live["windows"]] == ["5h", "week"]
+
+
 def _claude_code_module(creds, valid):
     return SimpleNamespace(read_claude_code_credentials=lambda: creds, is_claude_code_token_valid=lambda _: valid)
 
