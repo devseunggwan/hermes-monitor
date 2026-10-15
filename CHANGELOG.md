@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A refresh button at the top right of the Quotas menu re-reads every account now, skipping the two-minute refetch interval but not the backoff after a failed read; it rests for 30 seconds after each click.
 - Exhausted Claude and Codex accounts keep their five-hour and weekly rows instead of collapsing into one `limit` row: the limit that was hit reads 100%, a weekly-exhausted account's five-hour row reads 0% once five hours have passed since the bench, and a row that cannot be told reads `n/a`.
 - Quota windows show pace: an elapsed-time marker on each bar, an orange bar when usage at the current rate runs out before the reset, and the projected run-out time in the menu.
 - Fixed borrowed credentials (`claude_code`, `env:*`) always showing `n/a`: their secret is resolved read-only inside the profile scope; an expired Claude Code token is skipped, never refreshed.

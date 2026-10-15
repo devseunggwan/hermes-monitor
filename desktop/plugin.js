@@ -13,7 +13,8 @@
  *
  * Both poll their own backend namespace via `ctx.rest` (namespace-relative
  * paths only — see the plugin contract). Periodic polling never bypasses the
- * backend cache; opening the menu on click re-fetches with `?fresh=1`.
+ * backend cache; opening the menu on click re-fetches with `?fresh=1`, and the
+ * Quotas menu's top-right button re-reads every account with `?force=1`.
  *
  * Polling uses React Query `refetchInterval` (the app's shared QueryClient),
  * so the timers are torn down automatically when the item unmounts and the
@@ -47,6 +48,9 @@ const ID = 'hermes-monitor'
 // Polling cadences (ms). Never below 10s.
 const WORKER_INTERVAL_MS = 10_000
 const QUOTA_INTERVAL_MS = 60_000
+// After a forced refresh the button rests this long: every click re-reads every account, and the
+// usage API answers bursts with a 429 that holds for minutes.
+const FORCE_COOLDOWN_MS = 30_000
 
 // Traffic-light colors for the worker states. Mid-saturation hues that stay
 // legible on both the light and dark themes (bars + status dots).
@@ -117,6 +121,13 @@ function formatResetTime(epoch) {
   const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`
   if (d.toDateString() === new Date().toDateString()) return time
   return `${pad2(d.getMonth() + 1)}/${pad2(d.getDate())} ${time}`
+}
+
+/** epoch seconds -> local "HH:MM:SS"; garbage -> "n/a". */
+function formatClock(epoch) {
+  if (!Number.isFinite(epoch)) return 'n/a'
+  const d = new Date(epoch * 1000)
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`
 }
 
 function formatDuration(totalSeconds) {
@@ -208,17 +219,20 @@ function useMonitor(ctx, path, intervalMs) {
     if (!query.isError) setFreshFailed(false)
   }, [query.isError, query.dataUpdatedAt])
 
-  const refreshFresh = useCallback(() => {
+  const [forcing, setForcing] = useState(false)
+
+  // One cache-bypassing request; `query` is the backend flag (`fresh=1` or `force=1`).
+  const requestNow = useCallback(query => {
     openRef.current = true
     let request
     try {
-      request = ctx.rest(`${path}?fresh=1`)
+      request = ctx.rest(`${path}?${query}`)
     } catch {
       // Bridge threw synchronously: same neutral outcome as a rejection.
       setFreshFailed(true)
-      return
+      return Promise.resolve()
     }
-    Promise.resolve(request)
+    return Promise.resolve(request)
       .then(data => {
         // Replace the polling snapshot in the shared cache so the footer and
         // open menu always render the same response.
@@ -231,6 +245,26 @@ function useMonitor(ctx, path, intervalMs) {
       })
   }, [ctx, path, queryClient])
 
+  const refreshFresh = useCallback(() => {
+    requestNow('fresh=1')
+  }, [requestNow])
+
+  // Epoch ms until which a forced refresh is refused; 0 when the button is ready.
+  const [cooldownUntil, setCooldownUntil] = useState(0)
+  const cooldownTimer = useRef(null)
+
+  useEffect(() => () => clearTimeout(cooldownTimer.current), [])
+
+  // Re-reads every account now (the backend still honours its failure backoff), then rests.
+  const refreshForce = useCallback(() => {
+    if (forcing || Date.now() < cooldownUntil) return
+    setCooldownUntil(Date.now() + FORCE_COOLDOWN_MS)
+    clearTimeout(cooldownTimer.current)
+    cooldownTimer.current = setTimeout(() => setCooldownUntil(0), FORCE_COOLDOWN_MS)
+    setForcing(true)
+    requestNow('force=1').finally(() => setForcing(false))
+  }, [forcing, cooldownUntil, requestNow])
+
   const close = useCallback(() => {
     openRef.current = false
     setFreshFailed(false)
@@ -241,7 +275,7 @@ function useMonitor(ctx, path, intervalMs) {
   const failed = query.isError === true || query.isRefetchError === true || freshFailed
   const data = failed ? null : query.data
 
-  return { data, error: failed, refreshFresh, close }
+  return { data, error: failed, refreshFresh, refreshForce, forcing, cooldownUntil, close }
 }
 
 // -- shared chrome helpers ----------------------------------------------------
@@ -777,8 +811,52 @@ function buildProviderMenuNodes(providers) {
   return nodes
 }
 
+/**
+ * Small top-right button that re-reads every account now. A plain button, not a menu item, so the
+ * menu stays open while the new figures replace the old ones. It rests for FORCE_COOLDOWN_MS after
+ * each click.
+ */
+function renderForceRefreshButton(onRefresh, busy, generatedAt, cooldownUntil = 0) {
+  const updated = Number.isFinite(generatedAt) ? ` · updated ${formatClock(generatedAt)}` : ''
+  const cooling = !busy && Number.isFinite(cooldownUntil) && cooldownUntil > Date.now()
+  const blocked = busy || cooling
+  return jsx('button', {
+    type: 'button',
+    'aria-label': 'Refresh quotas now',
+    title: busy
+      ? 'Refreshing…'
+      : cooling
+        ? `Refresh again at ${formatClock(Math.ceil(cooldownUntil / 1000))}${updated}`
+        : `Refresh now${updated}`,
+    disabled: blocked,
+    onClick: event => {
+      event.preventDefault()
+      event.stopPropagation()
+      onRefresh()
+    },
+    className: 'rounded-sm text-(--ui-text-quaternary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+    style: {
+      position: 'absolute',
+      top: '0.25rem',
+      right: '0.25rem',
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      width: '1.25rem',
+      height: '1.25rem',
+      padding: 0,
+      border: 0,
+      background: 'transparent',
+      cursor: blocked ? 'default' : 'pointer',
+      opacity: blocked ? 0.6 : 1,
+      zIndex: 1
+    },
+    children: jsx(icons.RefreshCw, { className: busy ? 'size-3 animate-spin' : 'size-3' })
+  }, 'force-refresh')
+}
+
 function QuoteChip({ ctx }) {
-  const { data, error, refreshFresh, close } = useMonitor(ctx, '/quotas', QUOTA_INTERVAL_MS)
+  const { data, error, refreshFresh, refreshForce, forcing, cooldownUntil, close } = useMonitor(ctx, '/quotas', QUOTA_INTERVAL_MS)
 
   const providers = (Array.isArray(data?.providers) ? data.providers : []).filter(p => p && typeof p === 'object')
 
@@ -819,8 +897,8 @@ function QuoteChip({ ctx }) {
         align: 'end',
         side: 'top',
         sideOffset: 8,
-        style: { minWidth: '20rem' },
-        children: menuChildren
+        style: { minWidth: '20rem', position: 'relative' },
+        children: [renderForceRefreshButton(refreshForce, forcing, data?.generated_at, cooldownUntil), ...menuChildren]
       })
     ]
   })

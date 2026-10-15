@@ -302,16 +302,21 @@ _last_good: dict[str, tuple[float, Any]] = {}
 _last_failure: dict[str, float] = {}
 
 
-def _recent(key: str | None) -> tuple[Any, int | None] | None:
-    """Cached reading to serve instead of a live call, or ``None`` when a call is due."""
+def _recent(key: str | None, force: bool = False) -> tuple[Any, int | None] | None:
+    """Cached reading to serve instead of a live call, or ``None`` when a call is due.
+
+    *force* skips the refetch interval but never the failure backoff: a usage API that just
+    answered 429 keeps answering it for minutes. The backoff is checked first so a forced read
+    that failed inside the refetch interval keeps its figures flagged stale.
+    """
     if key is None:
         return None
     now = time.time()
-    cached = _last_good.get(key)
-    if cached is not None and now - cached[0] < MIN_REFETCH_S:
-        return cached[1], None
     if now - _last_failure.get(key, 0.0) < FAILURE_BACKOFF_S:
         return _remember(key, None)
+    cached = _last_good.get(key)
+    if not force and cached is not None and now - cached[0] < MIN_REFETCH_S:
+        return cached[1], None
     return None
 
 
@@ -348,13 +353,15 @@ def _remember(key: str | None, result: Any) -> tuple[Any, int | None]:
     return cached[1], int(cached[0])
 
 
-async def _snapshot_fetch(provider: str, snapshot: _PoolEntrySnapshot, shared: dict[str, Any] | None) -> Any:
+async def _snapshot_fetch(
+    provider: str, snapshot: _PoolEntrySnapshot, shared: dict[str, Any] | None, force: bool = False
+) -> Any:
     """Fetch usage for one sibling snapshot entry; never refreshes the sibling's token."""
     key = snapshot.entry_id
     if shared is not None and key is not None and key in shared:
         return shared[key]
     cache_key = f"{provider}:{key}" if key is not None else None
-    result = _recent(cache_key)
+    result = _recent(cache_key, force)
     if result is None and _known_unreadable(snapshot):
         result = _remember(cache_key, None)
     if result is None:
@@ -377,6 +384,7 @@ async def _collect_usage_from_snapshots(
     label: str | None,
     shared: dict[str, Any] | None,
     active: bool = False,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Collect usage from a profile's immutable snapshots, strictly read-only.
 
@@ -390,7 +398,7 @@ async def _collect_usage_from_snapshots(
     secrets = tuple(
         secret for snapshot in snapshots for secret in (snapshot.access_token, snapshot.refresh_token) if secret
     )
-    calls = [_snapshot_fetch(provider, snapshot, shared) for snapshot in snapshots]
+    calls = [_snapshot_fetch(provider, snapshot, shared, force) for snapshot in snapshots]
     results = await asyncio.gather(*calls)
     # Hermes skips benched and dead rows, so the account in use is the first one that is neither.
     active_index = next(
@@ -720,7 +728,9 @@ def _snapshot_pool_for_profile(
         _reset_secret_scope(secret_token)
 
 
-async def _collect_usage_provider_cross_profile(provider: str, profiles: list[tuple[str, Path]], label: str) -> dict[str, Any] | None:
+async def _collect_usage_provider_cross_profile(
+    provider: str, profiles: list[tuple[str, Path]], label: str, force: bool = False
+) -> dict[str, Any] | None:
     """Collect *provider* usage across every profile, deduplicating accounts by entry id.
 
     Accounts are tagged with their ``profile`` (the profile whose own auth.json holds the
@@ -755,7 +765,7 @@ async def _collect_usage_provider_cross_profile(provider: str, profiles: list[tu
             continue
         try:
             envelope = await _collect_usage_from_snapshots(
-                provider, snapshots, label, shared, active=profile_index == 0
+                provider, snapshots, label, shared, active=profile_index == 0, force=force
             )
         except Exception as error:
             failures.add(_failure_name(error))
@@ -812,7 +822,7 @@ def _reads_account_usage(provider: str, supported: set[str]) -> bool:
     return profile is not None and type(profile).fetch_account_usage is not base_hook
 
 
-async def _collect_quota_sources() -> dict[str, Any]:
+async def _collect_quota_sources(force: bool = False) -> dict[str, Any]:
     credential_module = importlib.import_module("agent.credential_pool")
     account_usage_module = importlib.import_module("agent.account_usage")
     registry = getattr(credential_module, "PROVIDER_REGISTRY", {})
@@ -850,7 +860,7 @@ async def _collect_quota_sources() -> dict[str, Any]:
                 "accounts": [{"account_label": "default", "active": True, "source": snapshot}],
             }
             continue
-        source = await _collect_usage_provider_cross_profile(provider, profiles, label)
+        source = await _collect_usage_provider_cross_profile(provider, profiles, label, force)
         if source is None:
             continue
         accounts = source.get("accounts", [])
@@ -889,9 +899,12 @@ async def get_workers(fresh: int = Query(default=0, ge=0, le=1)) -> dict[str, An
 
 
 @router.get("/quotas")
-async def get_quotas(fresh: int = Query(default=0, ge=0, le=1)) -> dict[str, Any]:
+async def get_quotas(
+    fresh: int = Query(default=0, ge=0, le=1), force: int = Query(default=0, ge=0, le=1)
+) -> dict[str, Any]:
+    """``fresh`` skips the payload cache; ``force`` also re-reads accounts inside their refetch interval."""
     async def build() -> dict[str, Any]:
-        sources = await _collect_quota_sources()
+        sources = await _collect_quota_sources(force=bool(force))
         return build_quotas_response(sources, now=int(time.time()))
 
-    return await _cached(_quotas_cache, _quotas_lock, fresh, build)
+    return await _cached(_quotas_cache, _quotas_lock, fresh or force, build)
