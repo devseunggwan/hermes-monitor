@@ -380,8 +380,10 @@ async def _collect_usage_from_snapshots(
     )
     calls = [_snapshot_fetch(provider, snapshot, shared) for snapshot in snapshots]
     results = await asyncio.gather(*calls)
-    # Hermes skips benched rows, so the account in use is the first one not exhausted.
-    active_index = next((i for i, snapshot in enumerate(snapshots) if snapshot.exhausted_until is None), 0)
+    # Hermes skips benched and dead rows, so the account in use is the first one that is neither.
+    active_index = next(
+        (i for i, snapshot in enumerate(snapshots) if snapshot.exhausted_until is None and not snapshot.dead), 0
+    )
     return {
         "pool_size": len(snapshots),
         "provider_label": label,

@@ -1072,6 +1072,11 @@ def test_active_account_is_first_one_not_exhausted():
         envelope = asyncio.run(plugin_api._collect_usage_from_snapshots("anthropic", snapshots, "Claude", {}, active=True))
     assert [account["active"] for account in envelope["accounts"]] == [False, True]
 
+    dead_first = [plugin_api._PoolEntrySnapshot("d", "revoked", 0, "manual", "oauth", "t0", None, None, "anthropic", None, True)] + snapshots
+    with patch.object(plugin_api, "_fetch_account_usage", return_value=_usage_snapshot()):
+        envelope = asyncio.run(plugin_api._collect_usage_from_snapshots("anthropic", dead_first, "Claude", {}, active=True))
+    assert [account["active"] for account in envelope["accounts"]] == [False, False, True]
+
 
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()

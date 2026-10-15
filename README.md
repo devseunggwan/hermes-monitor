@@ -72,7 +72,7 @@ DeepSeek credentials are resolved from the process environment, the Hermes root 
 
 The backend opens the local Kanban and worker session databases in read-only mode. It returns activity metadata only. Message content and tool arguments never reach the frontend; arguments are represented by hashes for loop detection.
 
-Credentials stay in the backend and are never returned to the Desktop plugin. The only external requests are the DeepSeek balance API call (`GET https://api.deepseek.com/user/balance`) and the account-usage API calls already used by Hermes for Claude and Codex. Hermes core may refresh an Anthropic token for the active profile near expiry, or a Codex token after an HTTP 401, rewriting only that profile's `auth.json`; quota reads themselves use immutable snapshots and never refresh credentials. Each external call has a 15-second timeout, and quota results are cached for five minutes.
+Credentials stay in the backend and are never returned to the Desktop plugin. The only external requests are the DeepSeek balance API call (`GET https://api.deepseek.com/user/balance`) and the account-usage API calls already used by Hermes for Claude and Codex. Hermes core may refresh an Anthropic token for the active profile near expiry, or a Codex token after an HTTP 401, rewriting only that profile's `auth.json`; quota reads themselves use immutable snapshots and never refresh credentials. Each external call has a 15-second timeout, quota results are cached for 60 seconds, and each account's usage is read at most every two minutes (five after a failed read).
 
 ### Which credential files are read
 
