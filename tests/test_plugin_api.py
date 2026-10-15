@@ -1161,6 +1161,9 @@ def test_force_rereads_inside_the_refetch_interval_but_keeps_the_failure_backoff
         assert len(calls) == 3 and failed[0] == _usage_snapshot(2) and failed[1] is not None
         backoff = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None, force=True))
         assert len(calls) == 3 and backoff[0] == _usage_snapshot(2)
+        # A plain read inside the refetch interval must not hide the failure behind fresh-looking figures.
+        plain = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+        assert len(calls) == 3 and plain[0] == _usage_snapshot(2) and plain[1] is not None
 
 
 def test_quotas_route_force_skips_the_payload_cache_and_reaches_the_collector():

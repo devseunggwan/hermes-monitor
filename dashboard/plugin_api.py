@@ -306,16 +306,17 @@ def _recent(key: str | None, force: bool = False) -> tuple[Any, int | None] | No
     """Cached reading to serve instead of a live call, or ``None`` when a call is due.
 
     *force* skips the refetch interval but never the failure backoff: a usage API that just
-    answered 429 keeps answering it for minutes.
+    answered 429 keeps answering it for minutes. The backoff is checked first so a forced read
+    that failed inside the refetch interval keeps its figures flagged stale.
     """
     if key is None:
         return None
     now = time.time()
+    if now - _last_failure.get(key, 0.0) < FAILURE_BACKOFF_S:
+        return _remember(key, None)
     cached = _last_good.get(key)
     if not force and cached is not None and now - cached[0] < MIN_REFETCH_S:
         return cached[1], None
-    if now - _last_failure.get(key, 0.0) < FAILURE_BACKOFF_S:
-        return _remember(key, None)
     return None
 
 
