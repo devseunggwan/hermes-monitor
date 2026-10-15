@@ -852,7 +852,8 @@ def test_cross_profile_reuses_one_fetch_per_unique_credential():
     claude = _result_provider(plugin_api.build_quotas_response(sources, now=NOW), "claude")
 
     # Three profiles share one credential store: each credential must be fetched once, not once per profile.
-    assert calls == [("anthropic", "token-a"), ("anthropic", "token-b")]
+    # Fetches run concurrently, so their order is not part of the contract.
+    assert sorted(calls) == [("anthropic", "token-a"), ("anthropic", "token-b")]
     assert [account["account_label"] for account in claude["accounts"]] == ["primary", "backup"]
     assert [account["profile"] for account in claude["accounts"]] == ["default", "default"]
     assert claude["pool_size"] == 2
@@ -992,6 +993,36 @@ def test_read_at_tracks_the_held_reading():
     assert plugin_api._snapshot_from_row("anthropic", {"id": "a", "last_status_at": 123.5}).benched_at == 123.5
 
 
+def test_default_assignee_reads_the_root_session_store():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "state.db").touch()
+        (root / "profiles" / "named").mkdir(parents=True)
+        (root / "profiles" / "named" / "state.db").touch()
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert plugin_api._safe_profile_database("default") == root / "state.db"
+            assert plugin_api._safe_profile_database("named") == (root / "profiles" / "named" / "state.db").resolve()
+            for unsafe in ("", ".", "..", "../named", "a/b", "missing"):
+                assert plugin_api._safe_profile_database(unsafe) is None
+        (root / "state.db").unlink()
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert plugin_api._safe_profile_database("default") is None
+
+
+def test_workers_cache_expires_before_the_desktop_poll():
+    poll_s = 10  # desktop/plugin.js WORKER_INTERVAL_MS
+    assert plugin_api._workers_cache.ttl < poll_s
+    assert plugin_api._quotas_cache.ttl == 60
+
+    workers = plugin_api.TTLCache(plugin_api.WORKERS_CACHE_TTL_S)
+    workers.set({"count": 1}, now=0.0)
+    assert workers.get(now=poll_s) is None
+
+    quotas = plugin_api.TTLCache()
+    quotas.set({"providers": []}, now=0.0)
+    assert quotas.get(now=poll_s) == {"providers": []}
+
+
 def _claude_code_module(creds, valid):
     return SimpleNamespace(read_claude_code_credentials=lambda: creds, is_claude_code_token_valid=lambda _: valid)
 
@@ -1008,6 +1039,39 @@ def test_borrowed_claude_code_row_reads_its_token_read_only():
         snapshot = plugin_api._snapshot_from_row("anthropic", row)
     assert snapshot.access_token == "borrowed-token"
     assert snapshot.refresh_token is None
+
+
+def test_claude_code_login_is_read_once_per_collection():
+    row = {"id": "cc", "label": "claude_code", "source": "claude_code", "auth_type": "oauth"}
+    reads = []
+
+    def read_creds():
+        reads.append(1)
+        return {"accessToken": "borrowed-token"}
+
+    module = SimpleNamespace(read_claude_code_credentials=read_creds, is_claude_code_token_valid=lambda _: True)
+    memo = {}
+    with patch.object(plugin_api.importlib, "import_module", return_value=module):
+        tokens = [plugin_api._snapshot_from_row("anthropic", row, memo).access_token for _ in range(6)]
+    assert tokens == ["borrowed-token"] * 6 and len(reads) == 1
+
+
+def test_cross_profile_collection_shares_one_memo_off_the_event_loop():
+    seen = []
+
+    def fake_snapshot_pool(credential_module, provider, home_path, *, own=False, memo=None):
+        import threading
+        seen.append((id(memo), threading.current_thread() is threading.main_thread()))
+        return []
+
+    profiles = [("default", Path("/tmp/a")), ("one", Path("/tmp/b")), ("two", Path("/tmp/c"))]
+    with patch.object(plugin_api.importlib, "import_module", return_value=SimpleNamespace()), patch.object(
+        plugin_api, "_snapshot_pool_for_profile", fake_snapshot_pool
+    ):
+        asyncio.run(plugin_api._collect_usage_provider_cross_profile("anthropic", profiles, "Claude"))
+    assert len(seen) == 3
+    assert len({memo_id for memo_id, _ in seen}) == 1
+    assert not any(on_main for _, on_main in seen)
 
 
 def test_expired_borrowed_claude_code_token_is_skipped_not_refreshed():

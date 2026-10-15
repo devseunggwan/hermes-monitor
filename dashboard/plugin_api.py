@@ -44,6 +44,8 @@ except ImportError:  # Loaded by file path by the Hermes plugin loader: no packa
 router = APIRouter()
 TIMEOUT_S = 15
 CACHE_TTL_S = 60
+# Below the Desktop's 10 s workers poll, so every poll sees fresh worker state (a build is ~1 ms).
+WORKERS_CACHE_TTL_S = 5
 
 
 class TTLCache:
@@ -67,7 +69,7 @@ class TTLCache:
         return value
 
 
-_workers_cache = TTLCache()
+_workers_cache = TTLCache(WORKERS_CACHE_TTL_S)
 _quotas_cache = TTLCache()
 _workers_lock = asyncio.Lock()
 _quotas_lock = asyncio.Lock()
@@ -101,6 +103,10 @@ def _load_running_tasks() -> list[dict[str, Any]]:
 def _safe_profile_database(assignee: str) -> Path | None:
     if not assignee or assignee in {".", ".."} or Path(assignee).name != assignee:
         return None
+    if assignee == "default":
+        # The default profile is the root home itself; its sessions are not under profiles/.
+        root_database = _hermes_home() / "state.db"
+        return root_database if root_database.is_file() else None
     profiles = (_hermes_home() / "profiles").resolve()
     candidate = (profiles / assignee / "state.db").resolve()
     return candidate if candidate.is_relative_to(profiles) and candidate.is_file() else None
@@ -609,19 +615,30 @@ class _PoolEntrySnapshot:
     benched_at: float | None = None
 
 
-def _borrowed_token(provider: str, source: str) -> str:
+def _claude_code_token() -> str:
+    credentials = importlib.import_module("agent.anthropic_credentials")
+    creds = credentials.read_claude_code_credentials()
+    if creds and credentials.is_claude_code_token_valid(creds):
+        return str(creds.get("accessToken") or "")
+    return ""
+
+
+def _borrowed_token(provider: str, source: str, memo: dict[str, str] | None = None) -> str:
     """Secret of a borrowed row, which Hermes persists without it; ``""`` when unavailable.
 
     Must run inside the profile's home override + secret scope. Strictly read-only: an expired
     Claude Code token is skipped, never refreshed (its refresh tokens are single-use, so a
-    refresh here would log Claude Code out) and nothing is written.
+    refresh here would log Claude Code out) and nothing is written. The Claude Code login is
+    one per machine (a Keychain read of ~40 ms), so *memo* shares it across profiles; ``env:``
+    secrets are per profile and are not memoised.
     """
     try:
         if provider == "anthropic" and source == "claude_code":
-            credentials = importlib.import_module("agent.anthropic_credentials")
-            creds = credentials.read_claude_code_credentials()
-            if creds and credentials.is_claude_code_token_valid(creds):
-                return str(creds.get("accessToken") or "")
+            if memo is None:
+                return _claude_code_token()
+            if "claude_code" not in memo:
+                memo["claude_code"] = _claude_code_token()
+            return memo["claude_code"]
         elif source.startswith("env:"):
             return str(importlib.import_module("agent.secret_scope").get_secret(source[4:]) or "")
     except Exception:
@@ -639,7 +656,7 @@ def _exhausted_until(row: dict[str, Any], now: float) -> int | None:
     return int(reset_at)
 
 
-def _snapshot_from_row(provider: str, row: dict[str, Any]) -> _PoolEntrySnapshot:
+def _snapshot_from_row(provider: str, row: dict[str, Any], memo: dict[str, str] | None = None) -> _PoolEntrySnapshot:
     refresh_token = row.get("refresh_token")
     expires_at_ms = row.get("expires_at_ms")
     source = str(row.get("source") or "")
@@ -656,7 +673,7 @@ def _snapshot_from_row(provider: str, row: dict[str, Any]) -> _PoolEntrySnapshot
         priority=_priority(),
         source=source,
         auth_type=str(row.get("auth_type") or ""),
-        access_token=str(row.get("access_token") or "") or _borrowed_token(provider, source),
+        access_token=str(row.get("access_token") or "") or _borrowed_token(provider, source, memo),
         refresh_token=refresh_token if isinstance(refresh_token, str) and refresh_token else None,
         expires_at_ms=int(expires_at_ms) if isinstance(expires_at_ms, (int, float)) else None,
         provider=provider,
@@ -667,7 +684,7 @@ def _snapshot_from_row(provider: str, row: dict[str, Any]) -> _PoolEntrySnapshot
 
 
 def _snapshot_pool_for_profile(
-    credential_module: Any, provider: str, home_path: Path, *, own: bool = False
+    credential_module: Any, provider: str, home_path: Path, *, own: bool = False, memo: dict[str, str] | None = None
 ) -> list[_PoolEntrySnapshot] | None:
     """Read-only immutable snapshot of a profile's pool entries.
 
@@ -688,7 +705,7 @@ def _snapshot_pool_for_profile(
         rows = read_credential_pool(provider)
         if not isinstance(rows, list):
             return []
-        return [_snapshot_from_row(provider, row) for row in rows if isinstance(row, dict)]
+        return [_snapshot_from_row(provider, row, memo) for row in rows if isinstance(row, dict)]
 
     secret_token = _install_secret_scope(home_path)
     try:
@@ -720,13 +737,16 @@ async def _collect_usage_provider_cross_profile(provider: str, profiles: list[tu
     singleton_profile = "default"
     singleton_active = True
     shared: dict[str, Any] = {}
+    memo: dict[str, str] = {}
     failures: set[str] = set()
     for profile_index, (profile_name, home_path) in enumerate(profiles):
         # Every profile, including the active one, is read through an immutable snapshot.
         # This keeps quota reads from pruning, refreshing, or persisting any auth.json.
         try:
-            snapshots = _snapshot_pool_for_profile(
-                credential_module, provider, home_path, own=profile_index == 0
+            # File and Keychain reads block, so they run off the event loop that serves Desktop.
+            snapshots = await asyncio.to_thread(
+                _snapshot_pool_for_profile, credential_module, provider, home_path,
+                own=profile_index == 0, memo=memo,
             )
         except Exception as error:
             failures.add(_failure_name(error))
