@@ -860,6 +860,30 @@ def test_cross_profile_reuses_one_fetch_per_unique_credential():
     assert claude["status"] == "ok"
 
 
+def test_accounts_sharing_a_label_are_told_apart_by_entry_id():
+    root = Path("/tmp/hermes-root")
+    entries = [_pool_entry("id-a", "dup", "token-a", 0), _pool_entry("id-b", "dup", "token-b", 1), _pool_entry("id-c", "solo", "token-c", 2)]
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            registry = {"anthropic": SimpleNamespace(name="Anthropic", inference_base_url="https://api.anthropic.com")}
+            return _fake_credential_module(registry, {"anthropic": _FakePool(entries, entries[0])})
+        if name == "agent.account_usage":
+            return SimpleNamespace(_USAGE_FETCHERS={"anthropic": object()}, fetch_account_usage=lambda *a, **k: None)
+        raise AssertionError(name)
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=[("default", root)]
+    ), patch.object(plugin_api, "_fetch_account_usage", return_value=_usage_snapshot()), patch.object(
+        plugin_api, "_read_deepseek_credential", return_value=(None, None)
+    ):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+
+    claude = _result_provider(plugin_api.build_quotas_response(sources, now=NOW), "claude")
+
+    assert [account["account_label"] for account in claude["accounts"]] == ["dup · id-a", "dup · id-b", "solo"]
+
+
 def test_pool_resolution_failure_is_reported_as_nd_instead_of_hidden():
     def read_credential_pool(provider):
         raise RuntimeError(CANARY)

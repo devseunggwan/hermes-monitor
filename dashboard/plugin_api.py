@@ -15,6 +15,7 @@ import re
 import sqlite3
 import time
 import urllib.request
+from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -788,9 +789,14 @@ async def _collect_usage_provider_cross_profile(
             entry_profile[entry_id] = profile_name
             entry_active[entry_id] = profile_index == 0 and bool(account.get("active"))
     accounts: list[dict[str, Any]] = []
+    # Two pool entries can carry the same label (the same name given to two logins); the entry id
+    # tells their rows apart. Ids are random pool keys, not secrets.
+    label_counts = Counter(accounts_by_id[entry_id].get("account_label") for entry_id in order)
     for entry_id in order:
         account = dict(accounts_by_id[entry_id])
         account.pop("entry_id", None)
+        if label_counts[account.get("account_label")] > 1:
+            account["account_label"] = f"{account.get('account_label')} · {entry_id}"
         account["profile"] = entry_profile[entry_id]
         account["active"] = entry_active[entry_id]
         accounts.append(account)
