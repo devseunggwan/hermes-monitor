@@ -44,6 +44,8 @@ except ImportError:  # Loaded by file path by the Hermes plugin loader: no packa
 router = APIRouter()
 TIMEOUT_S = 15
 CACHE_TTL_S = 60
+# Below the Desktop's 10 s workers poll, so every poll sees fresh worker state (a build is ~1 ms).
+WORKERS_CACHE_TTL_S = 5
 
 
 class TTLCache:
@@ -67,7 +69,7 @@ class TTLCache:
         return value
 
 
-_workers_cache = TTLCache()
+_workers_cache = TTLCache(WORKERS_CACHE_TTL_S)
 _quotas_cache = TTLCache()
 _workers_lock = asyncio.Lock()
 _quotas_lock = asyncio.Lock()
