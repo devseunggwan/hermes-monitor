@@ -960,6 +960,22 @@ def test_secret_scope_helpers_degrade_without_agent_package():
         plugin_api._reset_secret_scope(scope_token)  # must not raise
 
 
+def test_default_assignee_reads_the_root_session_store():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "state.db").touch()
+        (root / "profiles" / "named").mkdir(parents=True)
+        (root / "profiles" / "named" / "state.db").touch()
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert plugin_api._safe_profile_database("default") == root / "state.db"
+            assert plugin_api._safe_profile_database("named") == (root / "profiles" / "named" / "state.db").resolve()
+            for unsafe in ("", ".", "..", "../named", "a/b", "missing"):
+                assert plugin_api._safe_profile_database(unsafe) is None
+        (root / "state.db").unlink()
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert plugin_api._safe_profile_database("default") is None
+
+
 def test_workers_cache_expires_before_the_desktop_poll():
     poll_s = 10  # desktop/plugin.js WORKER_INTERVAL_MS
     assert plugin_api._workers_cache.ttl < poll_s

@@ -103,6 +103,10 @@ def _load_running_tasks() -> list[dict[str, Any]]:
 def _safe_profile_database(assignee: str) -> Path | None:
     if not assignee or assignee in {".", ".."} or Path(assignee).name != assignee:
         return None
+    if assignee == "default":
+        # The default profile is the root home itself; its sessions are not under profiles/.
+        root_database = _hermes_home() / "state.db"
+        return root_database if root_database.is_file() else None
     profiles = (_hermes_home() / "profiles").resolve()
     candidate = (profiles / assignee / "state.db").resolve()
     return candidate if candidate.is_relative_to(profiles) and candidate.is_file() else None
