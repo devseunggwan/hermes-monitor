@@ -181,13 +181,17 @@ def _generic(source: Any, provider_id: str, label: str) -> dict[str, Any]:
     return {"id": provider_id, "label": label, "status": "ok", "windows": normalized}
 
 
-def _limit_reached(windows: list[dict[str, Any]], now: int | None) -> bool:
-    """A window at 100% that has not reset yet (or whose reset is unknown)."""
-    return any(
-        window["used_percent"] >= 100
-        and (window.get("reset_at") is None or now is None or window["reset_at"] > now)
-        for window in windows
-    )
+def _limit_reached(windows: list[dict[str, Any]], now: int | None, held: bool) -> bool:
+    """A window at 100% that has not reset yet. A reset time is needed to tell that about
+    *held* figures: without one the window may have emptied since they were read."""
+
+    def still_full(window: dict[str, Any]) -> bool:
+        reset_at = window.get("reset_at")
+        if reset_at is None:
+            return not held
+        return now is None or reset_at > now
+
+    return any(window["used_percent"] >= 100 and still_full(window) for window in windows)
 
 
 def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> dict[str, Any]:
@@ -214,9 +218,9 @@ def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> di
         # predate that bench (or there are none). A reading taken after the bench wins, even cached.
         stale_since = None
         status, windows = "exhausted", _exhausted_windows(normalized["id"], exhausted_until, now, windows, benched_at)
-    if status == "ok" and _limit_reached(windows, now):
+    if status == "ok" and _limit_reached(windows, now, held=stale_since is not None):
         # A window read at 100% is a hit limit whether or not Hermes has benched the account; usage
-        # cannot fall before that window resets, so even held figures still tell it.
+        # cannot fall before that window resets, so held figures still tell it while the reset is ahead.
         stale_since = None
         status = "exhausted"
     result = {

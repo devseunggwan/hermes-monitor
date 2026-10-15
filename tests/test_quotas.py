@@ -314,6 +314,17 @@ def test_held_figures_at_full_read_exhausted_not_cached():
     assert account["status"] == "exhausted" and "stale_since" not in account
 
 
+def test_held_figures_at_full_with_no_reset_time_stay_cached():
+    # The window may have reset since the held read, and nothing says when it would.
+    snapshot = _Snapshot([_Window("Current session", 100.0, None), _Window("Current week", 40.0, NOW + 86_400)])
+
+    held = _account(snapshot, stale_since=NOW - 300)
+    live = _account(snapshot)
+
+    assert held["status"] == "ok" and held["stale_since"] == NOW - 300
+    assert live["status"] == "exhausted"
+
+
 def test_a_full_window_past_its_reset_does_not_mark_the_account_exhausted():
     # Held figures from before the reset: the window has since emptied, so they only read as cached.
     snapshot = _Snapshot([_Window("Current session", 100.0, NOW - 60), _Window("Current week", 40.0, NOW + 86_400)])
