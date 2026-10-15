@@ -270,8 +270,10 @@ class _FakePool:
 @pytest.fixture(autouse=True)
 def _clear_last_good():
     plugin_api._last_good.clear()
+    plugin_api._last_failure.clear()
     yield
     plugin_api._last_good.clear()
+    plugin_api._last_failure.clear()
 
 
 def _pool_entry(identifier, label, token, priority):
@@ -1011,6 +1013,27 @@ def test_failed_read_falls_back_to_last_good_flagged_stale():
                                              "stale_since": NOW}]}
     account = plugin_api.build_quotas_response({"anthropic": source}, now=NOW)["providers"][0]["accounts"][0]
     assert account["status"] == "ok" and account["stale_since"] == NOW
+
+
+def test_each_account_is_read_at_most_once_per_interval_and_backs_off_after_failure():
+    snapshot = plugin_api._PoolEntrySnapshot("a", "acct", 0, "manual", "oauth", "t1", None, None, "anthropic")
+    calls = []
+
+    def fetch(*args):
+        calls.append(args)
+        return _usage_snapshot() if len(calls) == 1 else None
+
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=fetch):
+        first = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+        second = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+        assert len(calls) == 1 and second == first == (_usage_snapshot(), None)
+
+        stored_at, value = plugin_api._last_good["anthropic:a"]
+        plugin_api._last_good["anthropic:a"] = (stored_at - plugin_api.MIN_REFETCH_S, value)
+        failed = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+        assert len(calls) == 2 and failed[0] == value and failed[1] is not None
+        backoff = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+        assert len(calls) == 2 and backoff[0] == value
 
 
 def test_active_account_is_first_one_not_exhausted():

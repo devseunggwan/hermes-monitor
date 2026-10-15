@@ -288,7 +288,25 @@ async def _collect_usage_provider(
 # Last successful usage per pool entry. The usage endpoint answers bursts with 429 for minutes,
 # so a failed read falls back to the previous figures (flagged stale) instead of n/a.
 LAST_GOOD_MAX_AGE_S = 6 * 3600
+# The endpoint rate-limits each account within a few calls (Retry-After of minutes), and Hermes
+# reads it too, so one account is read at most this often and backs off after a failure.
+MIN_REFETCH_S = 120
+FAILURE_BACKOFF_S = 300
 _last_good: dict[str, tuple[float, Any]] = {}
+_last_failure: dict[str, float] = {}
+
+
+def _recent(key: str | None) -> tuple[Any, int | None] | None:
+    """Cached reading to serve instead of a live call, or ``None`` when a call is due."""
+    if key is None:
+        return None
+    now = time.time()
+    cached = _last_good.get(key)
+    if cached is not None and now - cached[0] < MIN_REFETCH_S:
+        return cached[1], None
+    if now - _last_failure.get(key, 0.0) < FAILURE_BACKOFF_S:
+        return _remember(key, None)
+    return None
 
 
 def _remember(key: str | None, result: Any) -> tuple[Any, int | None]:
@@ -310,12 +328,17 @@ async def _snapshot_fetch(provider: str, snapshot: _PoolEntrySnapshot, shared: d
     key = snapshot.entry_id
     if shared is not None and key is not None and key in shared:
         return shared[key]
-    result = (
-        await _limited_call(_fetch_account_usage, provider, snapshot.access_token, False)
-        if snapshot.access_token
-        else None
-    )
-    result = _remember(key, result)
+    cache_key = f"{provider}:{key}" if key is not None else None
+    result = _recent(cache_key)
+    if result is None:
+        live = (
+            await _limited_call(_fetch_account_usage, provider, snapshot.access_token, False)
+            if snapshot.access_token
+            else None
+        )
+        if live is None and cache_key is not None and snapshot.access_token:
+            _last_failure[cache_key] = time.time()
+        result = _remember(cache_key, live)
     if shared is not None and key is not None:
         shared[key] = result
     return result
