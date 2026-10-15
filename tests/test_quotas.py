@@ -174,6 +174,17 @@ def test_account_profile_surfaces_from_envelope_and_is_absent_for_plain_snapshot
     assert "profile" not in plain["accounts"][0]
 
 
+def test_account_email_surfaces_only_when_it_is_an_email():
+    def email_of(value):
+        envelope = {"accounts": [{"account_label": "primary", "active": True, "account_email": value, "source": _claude_snapshot()}]}
+        claude = next(p for p in build_quotas_response({"anthropic": envelope}, now=NOW)["providers"] if p["id"] == "claude")
+        return claude["accounts"][0].get("account_email")
+
+    assert email_of(" person@example.com ") == "person@example.com"
+    for rejected in (None, "", "no-at-sign", "a@b", "two@@example.com", "spaced name@example.com", 7, CANARY):
+        assert email_of(rejected) is None
+
+
 def test_provider_failures_are_sanitized_to_class_names_and_bounded():
     envelope = {
         "provider_label": "Anthropic",

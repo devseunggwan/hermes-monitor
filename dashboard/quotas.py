@@ -9,6 +9,8 @@ from typing import Any
 
 # Exception class names only: a raw message could carry a token, an absolute home path or a URL.
 _SAFE_FAILURE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,59}")
+# The one place an email may appear: the account's sign-in address, shown so its row tells which login it is.
+_EMAIL = re.compile(r"[^@\s]{1,64}@[^@\s]{1,190}\.[^@\s.]{2,63}")
 
 FIVE_HOURS_S = 5 * 3600
 ONE_WEEK_S = 7 * 86400
@@ -241,6 +243,9 @@ def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> di
     profile = metadata.get("profile")
     if isinstance(profile, str) and profile.strip() and "@" not in profile and len(profile) <= 64:
         result["profile"] = profile.strip()
+    email = metadata.get("account_email")
+    if isinstance(email, str) and _EMAIL.fullmatch(email.strip()):
+        result["account_email"] = email.strip()
     return result
 
 

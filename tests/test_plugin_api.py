@@ -271,9 +271,16 @@ class _FakePool:
 def _clear_last_good():
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
-    yield
+    plugin_api._emails.clear()
+    plugin_api._email_failures.clear()
+    # The profile lookup is real network I/O; tests that exercise it patch it themselves.
+    with patch.object(plugin_api, "_fetch_anthropic_email", return_value=None), \
+            patch.object(plugin_api, "_claude_code_email", return_value=None):
+        yield
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
+    plugin_api._emails.clear()
+    plugin_api._email_failures.clear()
 
 
 def _pool_entry(identifier, label, token, priority):
@@ -1248,6 +1255,99 @@ def test_active_account_is_first_one_not_exhausted():
     with patch.object(plugin_api, "_fetch_account_usage", return_value=_usage_snapshot()):
         envelope = asyncio.run(plugin_api._collect_usage_from_snapshots("anthropic", dead_first, "Claude", {}, active=True))
     assert [account["active"] for account in envelope["accounts"]] == [False, False, True]
+
+
+# Captured before the autouse fixture stubs them out.
+_REAL_FETCH_ANTHROPIC_EMAIL = plugin_api._fetch_anthropic_email
+_REAL_CLAUDE_CODE_EMAIL = plugin_api._claude_code_email
+
+
+def _oauth_snapshot(entry_id="a", token="t1", source="manual", dead=False):
+    return plugin_api._PoolEntrySnapshot(entry_id, "acct", 0, source, "oauth", token, None, None, "anthropic", None, dead)
+
+
+def test_anthropic_email_is_read_from_the_oauth_profile_without_leaking_the_token():
+    # Field names from a live GET /api/oauth/profile response (account.email).
+    body = {"account": {"email": "person@example.com", "uuid": "u"}, "organization": {"organization_type": "claude_max"}}
+    response = SimpleNamespace(read=lambda: json.dumps(body).encode("utf-8"))
+    seen = []
+
+    @contextlib.contextmanager
+    def fake_urlopen(request, timeout):
+        seen.append((request.full_url, request.get_method(), request.get_header("Authorization"), timeout))
+        yield response
+
+    with patch.object(plugin_api.urllib.request, "urlopen", side_effect=fake_urlopen):
+        assert _REAL_FETCH_ANTHROPIC_EMAIL(CANARY) == "person@example.com"
+    assert seen == [(plugin_api.ANTHROPIC_PROFILE_URL, "GET", f"Bearer {CANARY}", plugin_api.TIMEOUT_S)]
+
+    for malformed in ({}, {"account": None}, {"account": {"email": 3}}, []):
+        response = SimpleNamespace(read=lambda body=malformed: json.dumps(body).encode("utf-8"))
+        with patch.object(plugin_api.urllib.request, "urlopen", side_effect=lambda r, timeout: contextlib.nullcontext(response)):
+            assert _REAL_FETCH_ANTHROPIC_EMAIL("t") is None
+
+
+def test_claude_code_email_reads_its_config_and_honours_claude_config_dir():
+    with tempfile.TemporaryDirectory() as directory:
+        home, override = Path(directory) / "home", Path(directory) / "override"
+        home.mkdir()
+        override.mkdir()
+        # Field names from a real ~/.claude.json (oauthAccount.emailAddress).
+        (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "home@example.com"}}), encoding="utf-8")
+        (override / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "dir@example.com"}}), encoding="utf-8")
+        with patch.object(plugin_api.Path, "home", return_value=home):
+            with patch.dict(os.environ, {}, clear=True):
+                assert _REAL_CLAUDE_CODE_EMAIL() == "home@example.com"
+            with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(override)}, clear=True):
+                assert _REAL_CLAUDE_CODE_EMAIL() == "dir@example.com"
+            (home / ".claude.json").write_text("{not json", encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=True):
+                assert _REAL_CLAUDE_CODE_EMAIL() is None
+        with patch.object(plugin_api.Path, "home", return_value=Path(directory) / "missing"), patch.dict(os.environ, {}, clear=True):
+            assert _REAL_CLAUDE_CODE_EMAIL() is None
+
+
+def test_account_email_is_cached_per_entry_and_backs_off_after_a_failure():
+    snapshot = _oauth_snapshot()
+    with patch.object(plugin_api, "_fetch_anthropic_email", return_value="person@example.com") as fetch:
+        assert asyncio.run(plugin_api._account_email("anthropic", snapshot)) == "person@example.com"
+        assert asyncio.run(plugin_api._account_email("anthropic", snapshot)) == "person@example.com"
+    assert fetch.call_count == 1
+
+    # Past the TTL a failed re-read keeps the known email and is not retried inside the backoff.
+    stored_at, email = plugin_api._emails["anthropic:a"]
+    plugin_api._emails["anthropic:a"] = (stored_at - plugin_api.EMAIL_TTL_S, email)
+    with patch.object(plugin_api, "_fetch_anthropic_email", return_value=None) as fetch:
+        assert asyncio.run(plugin_api._account_email("anthropic", snapshot)) == "person@example.com"
+        assert asyncio.run(plugin_api._account_email("anthropic", snapshot)) == "person@example.com"
+    assert fetch.call_count == 1
+
+    # An entry never read successfully reports None, also inside its backoff.
+    other = _oauth_snapshot("b", "t2")
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=RuntimeError(CANARY)) as fetch:
+        assert asyncio.run(plugin_api._account_email("anthropic", other)) is None
+        assert asyncio.run(plugin_api._account_email("anthropic", other)) is None
+    assert fetch.call_count == 1
+
+
+def test_account_email_skips_other_providers_dead_and_tokenless_rows_and_reads_claude_code_locally():
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=AssertionError("called")):
+        assert asyncio.run(plugin_api._account_email("openai-codex", _oauth_snapshot())) is None
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot(dead=True))) is None
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot(token=""))) is None
+        with patch.object(plugin_api, "_claude_code_email", return_value="cc@example.com"):
+            assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot(source="claude_code"))) == "cc@example.com"
+
+
+def test_collected_accounts_carry_their_email_into_the_quotas_payload():
+    snapshots = [_oauth_snapshot("a", "t1"), _oauth_snapshot("b", "t2")]
+    emails = {"t1": "one@example.com", "t2": None}
+    with patch.object(plugin_api, "_fetch_account_usage", return_value=_usage_snapshot()), \
+            patch.object(plugin_api, "_fetch_anthropic_email", side_effect=lambda token: emails[token]):
+        envelope = asyncio.run(plugin_api._collect_usage_from_snapshots("anthropic", snapshots, "Claude", {}, active=True))
+    claude = _result_provider(plugin_api.build_quotas_response({"anthropic": envelope}, now=NOW), "claude")
+    assert [account.get("account_email") for account in claude["accounts"]] == ["one@example.com", None]
+    assert "t1" not in json.dumps(claude) and "t2" not in json.dumps(claude)
 
 
 def load_tests(loader, tests, pattern):

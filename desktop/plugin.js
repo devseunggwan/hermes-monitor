@@ -623,6 +623,15 @@ function naLine(key) {
   }, key)
 }
 
+/** Sign-in email under an account's header, so two rows of one login read as one. */
+function emailLine(email, key) {
+  return jsx('div', {
+    className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+    style: { paddingLeft: '1.125rem', lineHeight: 1.3, whiteSpace: 'nowrap' },
+    children: email
+  }, key)
+}
+
 /** Warning under a window that runs out at its rate so far before it resets. */
 function paceLine(win, key) {
   return jsx('div', {
@@ -653,8 +662,10 @@ function accountView(account, index) {
   const raw = typeof a.account_label === 'string' ? a.account_label.trim() : ''
   const plan = typeof a.plan === 'string' ? a.plan.trim() : ''
   const profile = typeof a.profile === 'string' ? a.profile.trim() : ''
+  const email = typeof a.account_email === 'string' ? a.account_email.trim() : ''
   return {
     label: raw || `account ${index + 1}`,
+    email: email || null,
     plan: plan || null,
     profile: profile || null,
     active: a.active === true,
@@ -768,6 +779,7 @@ function renderAccountRow(raw, index, providerIndex) {
   // provider id: an unusable account renders a bare "n/a", otherwise every
   // window is listed and a balance row is added when the payload has one.
   const lines = []
+  if (account.email) lines.push(emailLine(account.email, 'email'))
   if (!account.ok) {
     lines.push(naLine('nok'))
   } else {
