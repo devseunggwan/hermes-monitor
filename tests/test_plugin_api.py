@@ -1049,6 +1049,36 @@ def test_readonly_connection_reads_a_wal_database_nobody_has_open():
         assert not Path(f"{path}-wal").exists() and not Path(f"{path}-shm").exists()
 
 
+def _session_store(path, sessions):
+    with contextlib.closing(sqlite3.connect(path)) as connection:
+        connection.execute("CREATE TABLE sessions (id TEXT, source TEXT, started_at REAL)")
+        connection.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, content TEXT, "
+                           "tool_calls TEXT, timestamp REAL, active INTEGER, compacted INTEGER)")
+        for session_id, started_at, card_id, tool in sessions:
+            connection.execute("INSERT INTO sessions VALUES (?, 'kanban', ?)", (session_id, started_at))
+            connection.execute("INSERT INTO messages (session_id, content, tool_calls, timestamp, active, compacted) "
+                               "VALUES (?, ?, NULL, ?, 1, 0)", (session_id, f"work kanban task {card_id}", started_at))
+            calls = json.dumps([{"function": {"name": tool, "arguments": "{}"}}])
+            connection.execute("INSERT INTO messages (session_id, content, tool_calls, timestamp, active, compacted) "
+                               "VALUES (?, '', ?, ?, 1, 0)", (session_id, calls, started_at + 1))
+        connection.commit()
+
+
+def test_tool_events_come_from_the_cards_own_session():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _session_store(root / "state.db", [
+            ("other", NOW + 5, "t_other", "other_tool"),      # closest start, another card
+            ("mine", NOW + 20, "t_mine", "my_tool"),          # the card's own session
+            ("retry", NOW + 400, "t_mine", "retry_tool"),     # a later run of the same card
+        ])
+        task = {"id": "t_mine", "assignee": "default", "started_at": NOW}
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert [e["tool_name"] for e in plugin_api._load_tool_events(task)] == ["my_tool"]
+            # No session opens with the card: no activity rather than another card's.
+            assert plugin_api._load_tool_events({**task, "id": "t_absent"}) == []
+
+
 def test_default_assignee_reads_the_root_session_store():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

@@ -144,15 +144,28 @@ def _extract_calls(tool_calls: Any, timestamp: float) -> list[dict[str, Any]]:
     return events
 
 
+# A worker's session starts within about a minute of its run (measured -53 s to +78 s over 303
+# runs); the window leaves room without reaching a retry's session, and the closest match wins.
+SESSION_MATCH_BEFORE_S = 60
+SESSION_MATCH_AFTER_S = 300
+
+
 def _load_tool_events(task: dict[str, Any]) -> list[dict[str, Any]]:
     database = _safe_profile_database(str(task.get("assignee") or ""))
     if database is None:
         return []
     started = float(task.get("started_at") or 0)
+    card_id = str(task.get("id") or "")
+    if not card_id:
+        return []
     with closing(_readonly_connection(database)) as connection:
+        # The worker's session opens with its card id ("work kanban task <id>"). Matching on start
+        # time alone picks another card's session when several start together on one profile.
         session = connection.execute(
-            "SELECT id FROM sessions WHERE source = ? AND started_at >= ? ORDER BY ABS(started_at - ?) LIMIT 1",
-            ("kanban", started - 60, started),
+            "SELECT s.id FROM sessions s WHERE s.source = ? AND s.started_at BETWEEN ? AND ? "
+            "AND instr((SELECT m.content FROM messages m WHERE m.session_id = s.id ORDER BY m.id LIMIT 1), ?) > 0 "
+            "ORDER BY ABS(s.started_at - ?) LIMIT 1",
+            ("kanban", started - SESSION_MATCH_BEFORE_S, started + SESSION_MATCH_AFTER_S, card_id, started),
         ).fetchone()
         if session is None:
             return []

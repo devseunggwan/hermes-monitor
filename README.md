@@ -52,7 +52,7 @@ The Hermes plugin catalog accepts owner-maintained public repositories through a
 
 ## Worker health states
 
-Hermes Monitor reads running Kanban cards and their local worker activity:
+Hermes Monitor reads running Kanban cards and their local worker activity. A card's activity comes from its own session, the Kanban session whose first message names the card:
 
 - Active: recent worker activity.
 - Stalled: no activity for more than five minutes.
