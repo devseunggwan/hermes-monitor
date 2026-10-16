@@ -103,13 +103,23 @@ def _hermes_home() -> Path:
 
 
 def _load_running_tasks() -> list[dict[str, Any]]:
+    """Running cards; ``last_heartbeat_at`` is present only when the board has that column."""
     database = _hermes_home() / "kanban.db"
     with closing(_readonly_connection(database)) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+        heartbeat = "last_heartbeat_at" in columns
         rows = connection.execute(
-            "SELECT id, title, assignee, started_at FROM tasks WHERE status = ? ORDER BY started_at, id",
+            f"SELECT id, title, assignee, started_at{', last_heartbeat_at' if heartbeat else ''} "
+            "FROM tasks WHERE status = ? ORDER BY started_at, id",
             ("running",),
         ).fetchall()
-    return [{"id": row[0], "title": row[1], "assignee": row[2], "started_at": row[3], "kanban_url": None} for row in rows]
+    tasks = []
+    for row in rows:
+        task = {"id": row[0], "title": row[1], "assignee": row[2], "started_at": row[3], "kanban_url": None}
+        if heartbeat:
+            task["last_heartbeat_at"] = row[4]
+        tasks.append(task)
+    return tasks
 
 
 def _safe_profile_database(assignee: str) -> Path | None:

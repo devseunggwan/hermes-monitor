@@ -39,6 +39,22 @@ def is_repeated_tool_loop(events: Iterable[Mapping[str, Any]], minimum: int = 4)
     return run_length >= minimum
 
 
+# The kanban board marks a running card stale once its heartbeat is older than this (Desktop
+# kanban `ui.tsx`); Hermes refreshes the heartbeat from the worker's own activity, so a long tool
+# run or generation keeps it fresh while the tool-call log goes quiet.
+HEARTBEAT_STALE_S = 120
+# Fallback for a board without a heartbeat column: no tool call for this long reads as stalled.
+TOOL_GAP_STALE_S = 300
+
+
+def _stalled(task: Mapping[str, Any], last_activity_s: int | None, now: int) -> bool:
+    if "last_heartbeat_at" in task:
+        heartbeat = task["last_heartbeat_at"]
+        # No heartbeat yet is a worker still starting up, not a fault.
+        return isinstance(heartbeat, (int, float)) and now - heartbeat > HEARTBEAT_STALE_S
+    return last_activity_s is not None and last_activity_s > TOOL_GAP_STALE_S
+
+
 def build_workers_response(
     tasks: Iterable[Mapping[str, Any]],
     activity_by_card: Mapping[str, Iterable[Mapping[str, Any]]],
@@ -55,7 +71,7 @@ def build_workers_response(
         last_activity_s = max(0, int(now - last_timestamp)) if last_timestamp is not None else None
         if is_repeated_tool_loop(events):
             state = "loop"
-        elif last_activity_s is not None and last_activity_s > 300:
+        elif _stalled(task, last_activity_s, now):
             state = "stalled"
         else:
             state = "active"

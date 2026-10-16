@@ -1049,6 +1049,30 @@ def test_readonly_connection_reads_a_wal_database_nobody_has_open():
         assert not Path(f"{path}-wal").exists() and not Path(f"{path}-shm").exists()
 
 
+def _kanban_board(root, columns="id TEXT, title TEXT, assignee TEXT, status TEXT, started_at INTEGER, last_heartbeat_at INTEGER", rows=()):
+    with contextlib.closing(sqlite3.connect(root / "kanban.db")) as connection:
+        connection.execute(f"CREATE TABLE tasks ({columns})")
+        for row in rows:
+            connection.execute(f"INSERT INTO tasks VALUES ({', '.join('?' * len(row))})", row)
+        connection.commit()
+
+
+def test_running_tasks_carry_the_heartbeat_only_when_the_board_has_it():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _kanban_board(root, rows=[("t_a", "A", "default", "running", NOW - 60, NOW - 5), ("t_b", "B", "default", "done", NOW, None)])
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert plugin_api._load_running_tasks() == [
+                {"id": "t_a", "title": "A", "assignee": "default", "started_at": NOW - 60, "kanban_url": None, "last_heartbeat_at": NOW - 5}
+            ]
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _kanban_board(root, "id TEXT, title TEXT, assignee TEXT, status TEXT, started_at INTEGER",
+                      rows=[("t_a", "A", "default", "running", NOW - 60)])
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert "last_heartbeat_at" not in plugin_api._load_running_tasks()[0]
+
+
 def _session_store(path, sessions):
     with contextlib.closing(sqlite3.connect(path)) as connection:
         connection.execute("CREATE TABLE sessions (id TEXT, source TEXT, started_at REAL)")
