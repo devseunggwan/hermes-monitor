@@ -52,10 +52,10 @@ The Hermes plugin catalog accepts owner-maintained public repositories through a
 
 ## Worker health states
 
-Hermes Monitor reads running Kanban cards and their local worker activity:
+Hermes Monitor reads running Kanban cards and their local worker activity. A card's activity comes from its own session, the Kanban session whose first message names the card:
 
 - Active: recent worker activity.
-- Stalled: no activity for more than five minutes.
+- Stalled: the card's Kanban heartbeat is more than 120 seconds old (the board's own amber threshold). A card with no heartbeat yet is active. On a board without a heartbeat column: no tool call for more than five minutes.
 - Loop: the same tool with the same arguments appears at least four times in a row in the latest events.
 
 Loop has priority over stalled, and stalled has priority over active when several workers are running. The footer spinner runs while at least one worker is active.

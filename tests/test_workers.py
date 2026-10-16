@@ -64,6 +64,30 @@ def test_worker_shape_loop_priority_and_stall_threshold():
     assert "safe" not in json.dumps(result)
 
 
+def test_heartbeat_decides_stalls_when_the_board_has_one():
+    # A long tool run: no tool call for 50 minutes, but the worker kept its heartbeat fresh.
+    quiet_tools = [event("terminal", {}, NOW - 3000)]
+    tasks = [
+        {"id": "t_fresh", "started_at": NOW - 3600, "last_heartbeat_at": NOW - 120},
+        {"id": "t_stale", "started_at": NOW - 3600, "last_heartbeat_at": NOW - 121},
+        {"id": "t_none", "started_at": NOW - 3600, "last_heartbeat_at": None},
+    ]
+    activities = {task["id"]: quiet_tools for task in tasks}
+    # Tool calls a second ago do not hide a heartbeat gone quiet.
+    activities["t_stale"] = [event("terminal", {}, NOW - 1)]
+
+    states = {w["card_id"]: w["state"] for w in build_workers_response(tasks, activities, now=NOW)["workers"]}
+
+    assert states == {"t_fresh": "active", "t_stale": "stalled", "t_none": "active"}
+
+
+def test_loop_outranks_a_fresh_heartbeat():
+    repeated = [event("read_file", {"path": "a"}, NOW - i) for i in range(4, 0, -1)]
+    task = {"id": "t_loop", "started_at": NOW - 60, "last_heartbeat_at": NOW - 5}
+
+    assert build_workers_response([task], {"t_loop": repeated}, now=NOW)["workers"][0]["state"] == "loop"
+
+
 def test_unknown_activity_is_active_with_null_age():
     result = build_workers_response(
         [{"id": "t_x", "title": "Unknown", "assignee": "a", "started_at": NOW}],

@@ -78,7 +78,18 @@ _quotas_lock = asyncio.Lock()
 
 def _readonly_connection(path: Path) -> sqlite3.Connection:
     resolved = path.expanduser().resolve(strict=True)
-    return sqlite3.connect(f"file:{quote(str(resolved), safe='/')}?mode=ro", uri=True)
+    uri = f"file:{quote(str(resolved), safe='/')}"
+    connection = sqlite3.connect(f"{uri}?mode=ro", uri=True)
+    try:
+        connection.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        return connection
+    except sqlite3.OperationalError as error:
+        connection.close()
+        # A WAL database nobody has open keeps no -wal/-shm file, and a read-only connection cannot
+        # create them. With no -wal there is no writer, so the file alone is the whole database.
+        if getattr(error, "sqlite_errorcode", None) != sqlite3.SQLITE_CANTOPEN or Path(f"{resolved}-wal").exists():
+            raise
+    return sqlite3.connect(f"{uri}?immutable=1", uri=True)
 
 
 def _hermes_home() -> Path:
@@ -92,13 +103,23 @@ def _hermes_home() -> Path:
 
 
 def _load_running_tasks() -> list[dict[str, Any]]:
+    """Running cards; ``last_heartbeat_at`` is present only when the board has that column."""
     database = _hermes_home() / "kanban.db"
     with closing(_readonly_connection(database)) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+        heartbeat = "last_heartbeat_at" in columns
         rows = connection.execute(
-            "SELECT id, title, assignee, started_at FROM tasks WHERE status = ? ORDER BY started_at, id",
+            f"SELECT id, title, assignee, started_at{', last_heartbeat_at' if heartbeat else ''} "
+            "FROM tasks WHERE status = ? ORDER BY started_at, id",
             ("running",),
         ).fetchall()
-    return [{"id": row[0], "title": row[1], "assignee": row[2], "started_at": row[3], "kanban_url": None} for row in rows]
+    tasks = []
+    for row in rows:
+        task = {"id": row[0], "title": row[1], "assignee": row[2], "started_at": row[3], "kanban_url": None}
+        if heartbeat:
+            task["last_heartbeat_at"] = row[4]
+        tasks.append(task)
+    return tasks
 
 
 def _safe_profile_database(assignee: str) -> Path | None:
@@ -133,22 +154,43 @@ def _extract_calls(tool_calls: Any, timestamp: float) -> list[dict[str, Any]]:
     return events
 
 
+# A worker's session starts within about a minute of its run (measured -53 s to +78 s over 303
+# runs); the window leaves room without reaching a retry's session, and the closest match wins.
+SESSION_MATCH_BEFORE_S = 60
+SESSION_MATCH_AFTER_S = 300
+
+
+def _card_session(connection: sqlite3.Connection, card_id: str, started: float) -> str | None:
+    """The worker session of *card_id*'s run: it opens with the card id ("work kanban task <id>").
+
+    Matching on start time alone picks another card's session when several start together on one
+    profile. The id must stand as a whole token, so ``t_1`` never claims ``t_10``'s session.
+    """
+    token = re.compile(rf"(?<![\w-]){re.escape(card_id)}(?![\w-])")
+    candidates = connection.execute(
+        "SELECT s.id, (SELECT m.content FROM messages m WHERE m.session_id = s.id ORDER BY m.id LIMIT 1) "
+        "FROM sessions s WHERE s.source = ? AND s.started_at BETWEEN ? AND ? ORDER BY ABS(s.started_at - ?)",
+        ("kanban", started - SESSION_MATCH_BEFORE_S, started + SESSION_MATCH_AFTER_S, started),
+    ).fetchall()
+    return next((session_id for session_id, first in candidates if isinstance(first, str) and token.search(first)), None)
+
+
 def _load_tool_events(task: dict[str, Any]) -> list[dict[str, Any]]:
     database = _safe_profile_database(str(task.get("assignee") or ""))
     if database is None:
         return []
     started = float(task.get("started_at") or 0)
+    card_id = str(task.get("id") or "")
+    if not card_id:
+        return []
     with closing(_readonly_connection(database)) as connection:
-        session = connection.execute(
-            "SELECT id FROM sessions WHERE source = ? AND started_at >= ? ORDER BY ABS(started_at - ?) LIMIT 1",
-            ("kanban", started - 60, started),
-        ).fetchone()
+        session = _card_session(connection, card_id, started)
         if session is None:
             return []
         rows = connection.execute(
             "SELECT tool_calls, timestamp FROM messages WHERE session_id = ? AND tool_calls IS NOT NULL "
             "AND active = 1 AND compacted = 0 ORDER BY timestamp DESC, id DESC LIMIT 200",
-            (session[0],),
+            (session,),
         ).fetchall()
     events: list[dict[str, Any]] = []
     for tool_calls, timestamp in reversed(rows):

@@ -1028,6 +1028,91 @@ def test_read_at_tracks_the_held_reading():
     assert plugin_api._snapshot_from_row("anthropic", {"id": "a", "last_status_at": 123.5}).benched_at == 123.5
 
 
+def test_readonly_connection_reads_a_wal_database_nobody_has_open():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "kanban.db"
+        with contextlib.closing(sqlite3.connect(path)) as writer:
+            assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+            writer.execute("CREATE TABLE tasks (id TEXT)")
+            writer.execute("INSERT INTO tasks VALUES ('t_a')")
+            writer.commit()
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # The state of a board no process has open: every page is in the main file and there is no
+        # -wal/-shm (some SQLite builds keep an empty -wal on close, so drop it as Hermes' does).
+        for suffix in ("-wal", "-shm"):
+            Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+        with contextlib.closing(plugin_api._readonly_connection(path)) as reader:
+            assert reader.execute("SELECT id FROM tasks").fetchall() == [("t_a",)]
+            with pytest.raises(sqlite3.OperationalError):
+                reader.execute("INSERT INTO tasks VALUES ('t_b')")
+        assert not Path(f"{path}-wal").exists() and not Path(f"{path}-shm").exists()
+
+
+def _kanban_board(root, columns="id TEXT, title TEXT, assignee TEXT, status TEXT, started_at INTEGER, last_heartbeat_at INTEGER", rows=()):
+    with contextlib.closing(sqlite3.connect(root / "kanban.db")) as connection:
+        connection.execute(f"CREATE TABLE tasks ({columns})")
+        for row in rows:
+            connection.execute(f"INSERT INTO tasks VALUES ({', '.join('?' * len(row))})", row)
+        connection.commit()
+
+
+def test_running_tasks_carry_the_heartbeat_only_when_the_board_has_it():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _kanban_board(root, rows=[("t_a", "A", "default", "running", NOW - 60, NOW - 5), ("t_b", "B", "default", "done", NOW, None)])
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert plugin_api._load_running_tasks() == [
+                {"id": "t_a", "title": "A", "assignee": "default", "started_at": NOW - 60, "kanban_url": None, "last_heartbeat_at": NOW - 5}
+            ]
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _kanban_board(root, "id TEXT, title TEXT, assignee TEXT, status TEXT, started_at INTEGER",
+                      rows=[("t_a", "A", "default", "running", NOW - 60)])
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert "last_heartbeat_at" not in plugin_api._load_running_tasks()[0]
+
+
+def _session_store(path, sessions):
+    with contextlib.closing(sqlite3.connect(path)) as connection:
+        connection.execute("CREATE TABLE sessions (id TEXT, source TEXT, started_at REAL)")
+        connection.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, content TEXT, "
+                           "tool_calls TEXT, timestamp REAL, active INTEGER, compacted INTEGER)")
+        for session_id, started_at, card_id, tool in sessions:
+            connection.execute("INSERT INTO sessions VALUES (?, 'kanban', ?)", (session_id, started_at))
+            connection.execute("INSERT INTO messages (session_id, content, tool_calls, timestamp, active, compacted) "
+                               "VALUES (?, ?, NULL, ?, 1, 0)", (session_id, f"work kanban task {card_id}", started_at))
+            calls = json.dumps([{"function": {"name": tool, "arguments": "{}"}}])
+            connection.execute("INSERT INTO messages (session_id, content, tool_calls, timestamp, active, compacted) "
+                               "VALUES (?, '', ?, ?, 1, 0)", (session_id, calls, started_at + 1))
+        connection.commit()
+
+
+def test_tool_events_come_from_the_cards_own_session():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _session_store(root / "state.db", [
+            ("other", NOW + 5, "t_other", "other_tool"),      # closest start, another card
+            ("mine", NOW + 20, "t_mine", "my_tool"),          # the card's own session
+            ("retry", NOW + 400, "t_mine", "retry_tool"),     # a later run of the same card
+        ])
+        task = {"id": "t_mine", "assignee": "default", "started_at": NOW}
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert [e["tool_name"] for e in plugin_api._load_tool_events(task)] == ["my_tool"]
+            # No session opens with the card: no activity rather than another card's.
+            assert plugin_api._load_tool_events({**task, "id": "t_absent"}) == []
+
+
+def test_a_card_id_inside_a_longer_id_does_not_claim_that_session():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        # Only the longer card's session exists yet; the shorter id is a prefix of it.
+        _session_store(root / "state.db", [("longer", NOW + 5, "t_10", "longer_tool"), ("dashed", NOW + 6, "t_1-b", "dashed_tool")])
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert plugin_api._load_tool_events({"id": "t_1", "assignee": "default", "started_at": NOW}) == []
+            assert [e["tool_name"] for e in plugin_api._load_tool_events({"id": "t_10", "assignee": "default", "started_at": NOW})] == ["longer_tool"]
+
+
 def test_default_assignee_reads_the_root_session_store():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

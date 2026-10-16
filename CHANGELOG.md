@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A worker reads as stalled when its Kanban heartbeat is more than 120 s old, the threshold the Kanban board uses for its amber mark, instead of after five minutes without a tool call. A long tool run or generation keeps the heartbeat fresh, so it no longer reads as stalled; a board without a heartbeat column keeps the five-minute tool-call rule.
+- Worker activity is read from the card's own session (the Kanban session that opens with its card id), not the session started closest to the run. Cards started together on one profile no longer read each other's tool calls.
+- Fixed the Worker item failing intermittently: when no process had the Kanban board open, SQLite had removed its `-wal`/`-shm` files and the read-only connection could not open the board. It now reads the file as it is when no `-wal` exists, still without creating or writing any file.
 - Each Claude account row shows the email it is signed in with, so pool labels that hide the same login (or one label shared by two logins) can be told apart. OAuth accounts read it from Anthropic's OAuth profile endpoint once a day per account; the borrowed Claude Code login reads it from Claude Code's own config, with no network call.
 - Accounts that share a label in one provider show their pool entry id (`<label> · <id>`), so the rows can be told apart.
 - An account whose reading shows a window at 100% (not yet reset) shows `exhausted` instead of `ok`, even before Hermes benches it.
