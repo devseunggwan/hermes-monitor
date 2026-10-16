@@ -160,6 +160,21 @@ SESSION_MATCH_BEFORE_S = 60
 SESSION_MATCH_AFTER_S = 300
 
 
+def _card_session(connection: sqlite3.Connection, card_id: str, started: float) -> str | None:
+    """The worker session of *card_id*'s run: it opens with the card id ("work kanban task <id>").
+
+    Matching on start time alone picks another card's session when several start together on one
+    profile. The id must stand as a whole token, so ``t_1`` never claims ``t_10``'s session.
+    """
+    token = re.compile(rf"(?<![\w-]){re.escape(card_id)}(?![\w-])")
+    candidates = connection.execute(
+        "SELECT s.id, (SELECT m.content FROM messages m WHERE m.session_id = s.id ORDER BY m.id LIMIT 1) "
+        "FROM sessions s WHERE s.source = ? AND s.started_at BETWEEN ? AND ? ORDER BY ABS(s.started_at - ?)",
+        ("kanban", started - SESSION_MATCH_BEFORE_S, started + SESSION_MATCH_AFTER_S, started),
+    ).fetchall()
+    return next((session_id for session_id, first in candidates if isinstance(first, str) and token.search(first)), None)
+
+
 def _load_tool_events(task: dict[str, Any]) -> list[dict[str, Any]]:
     database = _safe_profile_database(str(task.get("assignee") or ""))
     if database is None:
@@ -169,20 +184,13 @@ def _load_tool_events(task: dict[str, Any]) -> list[dict[str, Any]]:
     if not card_id:
         return []
     with closing(_readonly_connection(database)) as connection:
-        # The worker's session opens with its card id ("work kanban task <id>"). Matching on start
-        # time alone picks another card's session when several start together on one profile.
-        session = connection.execute(
-            "SELECT s.id FROM sessions s WHERE s.source = ? AND s.started_at BETWEEN ? AND ? "
-            "AND instr((SELECT m.content FROM messages m WHERE m.session_id = s.id ORDER BY m.id LIMIT 1), ?) > 0 "
-            "ORDER BY ABS(s.started_at - ?) LIMIT 1",
-            ("kanban", started - SESSION_MATCH_BEFORE_S, started + SESSION_MATCH_AFTER_S, card_id, started),
-        ).fetchone()
+        session = _card_session(connection, card_id, started)
         if session is None:
             return []
         rows = connection.execute(
             "SELECT tool_calls, timestamp FROM messages WHERE session_id = ? AND tool_calls IS NOT NULL "
             "AND active = 1 AND compacted = 0 ORDER BY timestamp DESC, id DESC LIMIT 200",
-            (session[0],),
+            (session,),
         ).fetchall()
     events: list[dict[str, Any]] = []
     for tool_calls, timestamp in reversed(rows):

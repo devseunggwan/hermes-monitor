@@ -1103,6 +1103,16 @@ def test_tool_events_come_from_the_cards_own_session():
             assert plugin_api._load_tool_events({**task, "id": "t_absent"}) == []
 
 
+def test_a_card_id_inside_a_longer_id_does_not_claim_that_session():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        # Only the longer card's session exists yet; the shorter id is a prefix of it.
+        _session_store(root / "state.db", [("longer", NOW + 5, "t_10", "longer_tool"), ("dashed", NOW + 6, "t_1-b", "dashed_tool")])
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}):
+            assert plugin_api._load_tool_events({"id": "t_1", "assignee": "default", "started_at": NOW}) == []
+            assert [e["tool_name"] for e in plugin_api._load_tool_events({"id": "t_10", "assignee": "default", "started_at": NOW})] == ["longer_tool"]
+
+
 def test_default_assignee_reads_the_root_session_store():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
