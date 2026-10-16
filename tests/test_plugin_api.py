@@ -1028,6 +1028,27 @@ def test_read_at_tracks_the_held_reading():
     assert plugin_api._snapshot_from_row("anthropic", {"id": "a", "last_status_at": 123.5}).benched_at == 123.5
 
 
+def test_readonly_connection_reads_a_wal_database_nobody_has_open():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "kanban.db"
+        with contextlib.closing(sqlite3.connect(path)) as writer:
+            assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+            writer.execute("CREATE TABLE tasks (id TEXT)")
+            writer.execute("INSERT INTO tasks VALUES ('t_a')")
+            writer.commit()
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # The state of a board no process has open: every page is in the main file and there is no
+        # -wal/-shm (some SQLite builds keep an empty -wal on close, so drop it as Hermes' does).
+        for suffix in ("-wal", "-shm"):
+            Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+        with contextlib.closing(plugin_api._readonly_connection(path)) as reader:
+            assert reader.execute("SELECT id FROM tasks").fetchall() == [("t_a",)]
+            with pytest.raises(sqlite3.OperationalError):
+                reader.execute("INSERT INTO tasks VALUES ('t_b')")
+        assert not Path(f"{path}-wal").exists() and not Path(f"{path}-shm").exists()
+
+
 def test_default_assignee_reads_the_root_session_store():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

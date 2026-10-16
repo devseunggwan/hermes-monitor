@@ -78,7 +78,18 @@ _quotas_lock = asyncio.Lock()
 
 def _readonly_connection(path: Path) -> sqlite3.Connection:
     resolved = path.expanduser().resolve(strict=True)
-    return sqlite3.connect(f"file:{quote(str(resolved), safe='/')}?mode=ro", uri=True)
+    uri = f"file:{quote(str(resolved), safe='/')}"
+    connection = sqlite3.connect(f"{uri}?mode=ro", uri=True)
+    try:
+        connection.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        return connection
+    except sqlite3.OperationalError as error:
+        connection.close()
+        # A WAL database nobody has open keeps no -wal/-shm file, and a read-only connection cannot
+        # create them. With no -wal there is no writer, so the file alone is the whole database.
+        if getattr(error, "sqlite_errorcode", None) != sqlite3.SQLITE_CANTOPEN or Path(f"{resolved}-wal").exists():
+            raise
+    return sqlite3.connect(f"{uri}?immutable=1", uri=True)
 
 
 def _hermes_home() -> Path:
