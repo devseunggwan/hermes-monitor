@@ -732,7 +732,9 @@ function renderAccountRow(raw, index, providerIndex) {
       }, 'dot'),
       jsx('span', {
         className: account.active ? 'font-medium text-(--ui-text-secondary)' : 'text-(--ui-text-quaternary)',
-        style: { lineHeight: 1.3, whiteSpace: 'nowrap' },
+        // A long email shrinks with an ellipsis so profile, state and the active mark stay visible.
+        style: { lineHeight: 1.3, whiteSpace: 'nowrap', minWidth: 0, flex: '0 1 auto', overflow: 'hidden', textOverflow: 'ellipsis' },
+        title: account.label,
         children: account.label
       }, 'label'),
       account.profile
@@ -899,7 +901,8 @@ function QuoteChip({ ctx }) {
         align: 'end',
         side: 'top',
         sideOffset: 8,
-        style: { minWidth: '20rem', position: 'relative' },
+        // Capped so a long account email truncates instead of widening the menu.
+        style: { minWidth: '20rem', maxWidth: '24rem', position: 'relative' },
         children: [renderForceRefreshButton(refreshForce, forcing, data?.generated_at, cooldownUntil), ...menuChildren]
       })
     ]
