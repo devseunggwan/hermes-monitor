@@ -7,6 +7,7 @@ small wrappers and individually limited to 15 seconds.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import inspect
 import json
@@ -26,6 +27,11 @@ from typing import Any, Callable
 from urllib.parse import quote, urlparse
 
 from fastapi import APIRouter, Query
+
+try:
+    import fcntl
+except ImportError:  # Windows: the store is then guarded within one process only.
+    fcntl = None
 
 try:
     from .quotas import build_quotas_response
@@ -427,7 +433,7 @@ ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 # A login's email does not change, so one profile call per account a day is enough.
 EMAIL_TTL_S = 24 * 3600
 EMAIL_FAILURE_BACKOFF_S = 30 * 60
-_emails: dict[str, tuple[float, str]] = {}
+_emails: dict[str, "_StoredEmail"] = {}
 _email_failures: dict[str, float] = {}
 
 
@@ -467,11 +473,25 @@ _emails_loaded = False
 _email_store_lock = threading.Lock()
 
 
+@dataclass(frozen=True)
+class _StoredEmail:
+    read_at: float
+    email: str
+    # Hash of the token the email was read with: a pool entry Hermes seeds from a singleton
+    # source keeps its id when that source signs in to another account, so the id alone cannot
+    # tell a stale email from a current one.
+    fingerprint: str | None
+
+
+def _token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
 def _email_store_path() -> Path:
     return _hermes_home() / EMAIL_STORE
 
 
-def _read_stored_emails(path: Path) -> dict[str, tuple[float, str]]:
+def _read_stored_emails(path: Path) -> dict[str, _StoredEmail]:
     """Emails kept from earlier runs; a missing or malformed file reads as empty."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -481,22 +501,31 @@ def _read_stored_emails(path: Path) -> dict[str, tuple[float, str]]:
         return {}
     stored = {}
     for key, value in raw.items():
-        email = value.get("email") if isinstance(value, dict) else None
-        read_at = value.get("read_at") if isinstance(value, dict) else None
+        value = value if isinstance(value, dict) else {}
+        email, read_at, fingerprint = value.get("email"), value.get("read_at"), value.get("fingerprint")
         if isinstance(email, str) and isinstance(read_at, (int, float)):
-            stored[key] = (float(read_at), email)
+            stored[key] = _StoredEmail(float(read_at), email, fingerprint if isinstance(fingerprint, str) else None)
     return stored
 
 
-def _write_stored_emails(path: Path, emails: dict[str, tuple[float, str]]) -> None:
-    """Atomic owner-only write: the file names which login each pool entry is.
+def _update_stored_emails(path: Path, update: Callable[[dict[str, _StoredEmail]], bool]) -> None:
+    """Read-modify-write the store under a lock every backend process shares.
 
-    Accounts resolve concurrently, so the copy is taken under the lock: the last writer then
-    always holds every email, and an older snapshot can never replace a newer file.
+    Several Desktop backends can run on one Hermes home, each with its own memory; re-reading the
+    file inside the lock keeps one process from replacing what another just stored. The write is
+    an atomic replace of an owner-only file.
     """
-    with _email_store_lock:
-        payload = {key: {"email": email, "read_at": read_at} for key, (read_at, email) in dict(emails).items()}
-        path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _email_store_lock, open(path.with_name(f".{path.name}.lock"), "a") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        stored = _read_stored_emails(path)
+        if not update(stored):
+            return
+        payload = {
+            key: {"email": entry.email, "read_at": entry.read_at, "fingerprint": entry.fingerprint}
+            for key, entry in stored.items()
+        }
         descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # created 0600
         os.close(descriptor)
         temporary = Path(name)
@@ -505,6 +534,28 @@ def _write_stored_emails(path: Path, emails: dict[str, tuple[float, str]]) -> No
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def _store_email(path: Path, key: str, entry: _StoredEmail) -> None:
+    def keep_newer(stored: dict[str, _StoredEmail]) -> bool:
+        current = stored.get(key)
+        if current is not None and current.read_at > entry.read_at:
+            return False
+        stored[key] = entry
+        return True
+
+    _update_stored_emails(path, keep_newer)
+
+
+def _prune_stored_emails(path: Path, provider: str, live_keys: set[str]) -> None:
+    """Drop stored emails of *provider* entries no longer in any pool (e.g. ``hermes auth remove``)."""
+    def drop_removed(stored: dict[str, _StoredEmail]) -> bool:
+        removed = [key for key in stored if key.startswith(f"{provider}:") and key not in live_keys]
+        for key in removed:
+            del stored[key]
+        return bool(removed)
+
+    _update_stored_emails(path, drop_removed)
 
 
 async def _load_stored_emails() -> None:
@@ -533,22 +584,26 @@ async def _account_email(provider: str, snapshot: _PoolEntrySnapshot) -> str | N
     key = f"{provider}:{snapshot.entry_id}"
     now = time.time()
     cached = _emails.get(key)
-    known = cached[1] if cached is not None else None
-    # Dead, tokenless or benched-and-expired rows can only fail a read; they keep the stored email.
+    known = cached.email if cached is not None else None
+    # Dead, tokenless or benched-and-expired rows can only fail a read; the stored email is the
+    # best answer they have.
     if not snapshot.access_token or _known_unreadable(snapshot):
         return known
-    if cached is not None and now - cached[0] < EMAIL_TTL_S:
+    fingerprint = _token_fingerprint(snapshot.access_token)
+    # A token other than the one the email was read with may belong to another login: re-read it.
+    if cached is not None and cached.fingerprint == fingerprint and now - cached.read_at < EMAIL_TTL_S:
         return known
     if now - _email_failures.get(key, 0.0) < EMAIL_FAILURE_BACKOFF_S:
         return known
     email = await _limited_call(_fetch_anthropic_email, snapshot.access_token)
     if email:
-        _emails[key] = (now, email)
-        # Persisting the fresh read time keeps a restart within the once-a-day profile read.
-        await _limited_call(_write_stored_emails, _email_store_path(), _emails)
+        entry = _StoredEmail(now, email, fingerprint)
+        _emails[key] = entry
+        # Persisting every read keeps a restart within the once-a-day profile read.
+        await _limited_call(_store_email, _email_store_path(), key, entry)
         return email
     _email_failures[key] = now
-    # A failed re-read keeps the email already known: it cannot have changed.
+    # A failed re-read keeps the email already known.
     return known
 
 
@@ -963,6 +1018,12 @@ async def _collect_usage_provider_cross_profile(
             order.append(entry_id)
             entry_profile[entry_id] = profile_name
             entry_active[entry_id] = profile_index == 0 and bool(account.get("active"))
+    if provider == "anthropic" and not failures:
+        # Every profile's pool was read, so an id missing from all of them was removed.
+        live_keys = {f"{provider}:{entry_id}" for entry_id in order}
+        for key in [key for key in _emails if key.startswith(f"{provider}:") and key not in live_keys]:
+            del _emails[key]
+        await _limited_call(_prune_stored_emails, _email_store_path(), provider, live_keys)
     accounts: list[dict[str, Any]] = []
     # Two pool entries can carry the same label (the same name given to two logins); the entry id
     # tells their rows apart. Ids are random pool keys, not secrets.

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- A Claude account Hermes benched on a quota limit keeps its email after a Desktop restart and after its token expires: each account's email is kept in an owner-only file under the Hermes home, and a benched account with an expired token is no longer sent to the profile endpoint (that read could only fail). Account rows are named by that email instead of `account N`.
+- A Claude account Hermes benched on a quota limit keeps its email after a Desktop restart and after its token expires: each account's email is kept in an owner-only file under the Hermes home, and a benched account with an expired token is no longer sent to the profile endpoint (that read could only fail). Account rows are named by that email instead of `account N`. A new token on the same pool entry triggers a fresh read, removed entries are dropped from the file, and concurrent backends merge their writes.
 - A worker reads as stalled when its Kanban heartbeat is more than 120 s old, the threshold the Kanban board uses for its amber mark, instead of after five minutes without a tool call. A long tool run or generation keeps the heartbeat fresh, so it no longer reads as stalled; a board without a heartbeat column keeps the five-minute tool-call rule.
 - Worker activity is read from the card's own session (the Kanban session that opens with its card id), not the session started closest to the run. Cards started together on one profile no longer read each other's tool calls.
 - Fixed the Worker item failing intermittently: when no process had the Kanban board open, SQLite had removed its `-wal`/`-shm` files and the read-only connection could not open the board. It now reads the file as it is when no `-wal` exists, still without creating or writing any file.
