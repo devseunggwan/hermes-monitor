@@ -1,11 +1,13 @@
 import asyncio
 import builtins
+import dataclasses
 import contextlib
 import io
 import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -268,19 +270,23 @@ class _FakePool:
 
 
 @pytest.fixture(autouse=True)
-def _clear_last_good():
+def _clear_last_good(tmp_path):
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
     plugin_api._emails.clear()
     plugin_api._email_failures.clear()
+    plugin_api._emails_loaded = False
     # The profile lookup is real network I/O; tests that exercise it patch it themselves.
+    # The email store is redirected so a test never reads or writes the real Hermes home.
     with patch.object(plugin_api, "_fetch_anthropic_email", return_value=None), \
-            patch.object(plugin_api, "_claude_code_email", return_value=None):
+            patch.object(plugin_api, "_claude_code_email", return_value=None), \
+            patch.object(plugin_api, "_email_store_path", return_value=tmp_path / "account-emails.json"):
         yield
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
     plugin_api._emails.clear()
     plugin_api._email_failures.clear()
+    plugin_api._emails_loaded = False
 
 
 def _pool_entry(identifier, label, token, priority):
@@ -1400,8 +1406,8 @@ def test_account_email_is_cached_per_entry_and_backs_off_after_a_failure():
     assert fetch.call_count == 1
 
     # Past the TTL a failed re-read keeps the known email and is not retried inside the backoff.
-    stored_at, email = plugin_api._emails["anthropic:a"]
-    plugin_api._emails["anthropic:a"] = (stored_at - plugin_api.EMAIL_TTL_S, email)
+    held = plugin_api._emails["anthropic:a"]
+    plugin_api._emails["anthropic:a"] = dataclasses.replace(held, read_at=held.read_at - plugin_api.EMAIL_TTL_S)
     with patch.object(plugin_api, "_fetch_anthropic_email", return_value=None) as fetch:
         assert asyncio.run(plugin_api._account_email("anthropic", snapshot)) == "person@example.com"
         assert asyncio.run(plugin_api._account_email("anthropic", snapshot)) == "person@example.com"
@@ -1413,6 +1419,134 @@ def test_account_email_is_cached_per_entry_and_backs_off_after_a_failure():
         assert asyncio.run(plugin_api._account_email("anthropic", other)) is None
         assert asyncio.run(plugin_api._account_email("anthropic", other)) is None
     assert fetch.call_count == 1
+
+
+def _store(path, key, read_at, email, fingerprint=None):
+    plugin_api._store_email(path, key, plugin_api._StoredEmail(read_at, email, fingerprint))
+
+
+def test_account_email_survives_a_restart_through_the_owner_only_store():
+    store = plugin_api._email_store_path()
+    with patch.object(plugin_api, "_fetch_anthropic_email", return_value="person@example.com"):
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot())) == "person@example.com"
+    assert store.stat().st_mode & 0o777 == 0o600
+    assert json.loads(store.read_text(encoding="utf-8"))["anthropic:a"]["email"] == "person@example.com"
+    assert sorted(p.name for p in store.parent.iterdir()) == sorted([store.name, f".{store.name}.lock"])  # no temp file left
+
+    # A restart empties memory; the stored email is served without a network call.
+    plugin_api._emails.clear()
+    plugin_api._emails_loaded = False
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=AssertionError("called")):
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot())) == "person@example.com"
+
+
+def test_concurrent_account_reads_all_land_in_the_store():
+    snapshots = [_oauth_snapshot(f"e{i}", f"t{i}") for i in range(8)]
+
+    def fetch(token):
+        time.sleep(0.01 * (8 - int(token[1:])))  # finish in reverse order, as live reads do
+        return f"{token}@example.com"
+
+    async def resolve_all():
+        return await asyncio.gather(*(plugin_api._account_email("anthropic", s) for s in snapshots))
+
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=fetch):
+        asyncio.run(resolve_all())
+    stored = plugin_api._read_stored_emails(plugin_api._email_store_path())
+    assert {key: entry.email for key, entry in stored.items()} == {f"anthropic:e{i}": f"t{i}@example.com" for i in range(8)}
+
+    # After a restart every concurrent first read is served from the store, not only the first.
+    plugin_api._emails.clear()
+    plugin_api._emails_loaded = False
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=AssertionError("called")):
+        assert asyncio.run(resolve_all()) == [f"t{i}@example.com" for i in range(8)]
+
+
+def test_dead_and_tokenless_rows_keep_their_stored_email_without_a_profile_call():
+    store = plugin_api._email_store_path()
+    _store(store, "anthropic:a", 0.0, "dead@example.com")
+    _store(store, "anthropic:b", 0.0, "bare@example.com")
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=AssertionError("called")):
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot(dead=True))) == "dead@example.com"
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot("b", token=""))) == "bare@example.com"
+
+
+def test_an_unchanged_email_reread_persists_its_new_read_time():
+    store = plugin_api._email_store_path()
+    expired = time.time() - plugin_api.EMAIL_TTL_S - 1
+    _store(store, "anthropic:a", expired, "person@example.com", fingerprint=plugin_api._token_fingerprint("t1"))
+    with patch.object(plugin_api, "_fetch_anthropic_email", return_value="person@example.com") as fetch:
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot())) == "person@example.com"
+    assert fetch.call_count == 1
+    read_at = plugin_api._read_stored_emails(store)["anthropic:a"].read_at
+    assert time.time() - read_at < 5
+
+
+def test_benched_account_with_an_expired_token_keeps_its_stored_email_without_a_profile_call():
+    store = plugin_api._email_store_path()
+    now = time.time()
+    _store(store, "anthropic:a", now - plugin_api.EMAIL_TTL_S - 1, "person@example.com")
+    benched = plugin_api._PoolEntrySnapshot(
+        "a", "acct", 0, "manual", "oauth", "t1", None, int((now - 60) * 1000), "anthropic",
+        exhausted_until=int(now + 3600))
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=AssertionError("called")):
+        assert asyncio.run(plugin_api._account_email("anthropic", benched)) == "person@example.com"
+    assert "anthropic:a" not in plugin_api._email_failures
+
+
+def test_a_new_token_on_the_same_entry_rereads_the_email():
+    # A seeded singleton entry keeps its id when its source signs in to another account.
+    store = plugin_api._email_store_path()
+    _store(store, "anthropic:a", time.time(), "old@example.com", fingerprint=plugin_api._token_fingerprint("t1"))
+    with patch.object(plugin_api, "_fetch_anthropic_email", return_value="new@example.com") as fetch:
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot(token="t2"))) == "new@example.com"
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot(token="t2"))) == "new@example.com"
+    assert fetch.call_count == 1
+    assert plugin_api._read_stored_emails(store)["anthropic:a"].email == "new@example.com"
+
+
+def test_store_writes_merge_with_what_another_backend_stored():
+    store = plugin_api._email_store_path()
+    _store(store, "anthropic:a", 100.0, "a@example.com")
+    # Another backend process, holding nothing about "a", stores "b".
+    _store(store, "anthropic:b", 50.0, "b@example.com")
+    # An older read of "a" from a lagging process does not replace the newer one.
+    _store(store, "anthropic:a", 10.0, "stale@example.com")
+    stored = plugin_api._read_stored_emails(store)
+    assert {key: entry.email for key, entry in stored.items()} == {"anthropic:a": "a@example.com", "anthropic:b": "b@example.com"}
+
+
+def _collect_with_pool(entry_ids, fail=False):
+    def fake_snapshot_pool(credential_module, provider, home_path, *, own=False, memo=None):
+        if fail:
+            raise OSError("unreadable auth.json")
+        return [_oauth_snapshot(entry_id, f"tok-{entry_id}") for entry_id in entry_ids]
+
+    with patch.object(plugin_api.importlib, "import_module", return_value=SimpleNamespace()), \
+            patch.object(plugin_api, "_snapshot_pool_for_profile", fake_snapshot_pool), \
+            patch.object(plugin_api, "_fetch_account_usage", return_value=None):
+        asyncio.run(plugin_api._collect_usage_provider_cross_profile("anthropic", [("default", Path("/tmp/a"))], "Claude"))
+
+
+def test_removed_pool_entries_lose_their_stored_email_unless_a_pool_read_failed():
+    store = plugin_api._email_store_path()
+    for key in ("anthropic:a", "anthropic:gone", "openai-codex:x"):
+        _store(store, key, time.time(), f"{key}@example.com")
+    _collect_with_pool(["a"], fail=True)
+    assert set(plugin_api._read_stored_emails(store)) == {"anthropic:a", "anthropic:gone", "openai-codex:x"}
+    _collect_with_pool(["a"])
+    assert set(plugin_api._read_stored_emails(store)) == {"anthropic:a", "openai-codex:x"}
+    assert "anthropic:gone" not in plugin_api._emails
+
+
+def test_email_store_reads_missing_or_malformed_files_as_empty(tmp_path):
+    path = tmp_path / "emails.json"
+    assert plugin_api._read_stored_emails(path) == {}
+    for body in ("{not json", "[]", json.dumps({"k": "v"}), json.dumps({"k": {"email": 3, "read_at": 1}})):
+        path.write_text(body, encoding="utf-8")
+        assert plugin_api._read_stored_emails(path) == {}
+    path.write_text(json.dumps({"k": {"email": "e@example.com", "read_at": 5}, "bad": None}), encoding="utf-8")
+    assert plugin_api._read_stored_emails(path) == {"k": plugin_api._StoredEmail(5.0, "e@example.com", None)}
 
 
 def test_account_email_skips_other_providers_dead_and_tokenless_rows_and_reads_claude_code_locally():
