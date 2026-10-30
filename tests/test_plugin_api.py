@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -268,19 +269,23 @@ class _FakePool:
 
 
 @pytest.fixture(autouse=True)
-def _clear_last_good():
+def _clear_last_good(tmp_path):
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
     plugin_api._emails.clear()
     plugin_api._email_failures.clear()
+    plugin_api._emails_loaded = False
     # The profile lookup is real network I/O; tests that exercise it patch it themselves.
+    # The email store is redirected so a test never reads or writes the real Hermes home.
     with patch.object(plugin_api, "_fetch_anthropic_email", return_value=None), \
-            patch.object(plugin_api, "_claude_code_email", return_value=None):
+            patch.object(plugin_api, "_claude_code_email", return_value=None), \
+            patch.object(plugin_api, "_email_store_path", return_value=tmp_path / "account-emails.json"):
         yield
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
     plugin_api._emails.clear()
     plugin_api._email_failures.clear()
+    plugin_api._emails_loaded = False
 
 
 def _pool_entry(identifier, label, token, priority):
@@ -1413,6 +1418,65 @@ def test_account_email_is_cached_per_entry_and_backs_off_after_a_failure():
         assert asyncio.run(plugin_api._account_email("anthropic", other)) is None
         assert asyncio.run(plugin_api._account_email("anthropic", other)) is None
     assert fetch.call_count == 1
+
+
+def test_account_email_survives_a_restart_through_the_owner_only_store():
+    store = plugin_api._email_store_path()
+    with patch.object(plugin_api, "_fetch_anthropic_email", return_value="person@example.com"):
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot())) == "person@example.com"
+    assert store.stat().st_mode & 0o777 == 0o600
+    assert json.loads(store.read_text(encoding="utf-8"))["anthropic:a"]["email"] == "person@example.com"
+    assert [p.name for p in store.parent.iterdir()] == [store.name]  # no temp file left behind
+
+    # A restart empties memory; the stored email is served without a network call.
+    plugin_api._emails.clear()
+    plugin_api._emails_loaded = False
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=AssertionError("called")):
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot())) == "person@example.com"
+
+
+def test_concurrent_account_reads_all_land_in_the_store():
+    snapshots = [_oauth_snapshot(f"e{i}", f"t{i}") for i in range(8)]
+
+    def fetch(token):
+        time.sleep(0.01 * (8 - int(token[1:])))  # finish in reverse order, as live reads do
+        return f"{token}@example.com"
+
+    async def resolve_all():
+        return await asyncio.gather(*(plugin_api._account_email("anthropic", s) for s in snapshots))
+
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=fetch):
+        asyncio.run(resolve_all())
+    stored = plugin_api._read_stored_emails(plugin_api._email_store_path())
+    assert {key: email for key, (_, email) in stored.items()} == {f"anthropic:e{i}": f"t{i}@example.com" for i in range(8)}
+
+    # After a restart every concurrent first read is served from the store, not only the first.
+    plugin_api._emails.clear()
+    plugin_api._emails_loaded = False
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=AssertionError("called")):
+        assert asyncio.run(resolve_all()) == [f"t{i}@example.com" for i in range(8)]
+
+
+def test_benched_account_with_an_expired_token_keeps_its_stored_email_without_a_profile_call():
+    store = plugin_api._email_store_path()
+    now = time.time()
+    plugin_api._write_stored_emails(store, {"anthropic:a": (now - plugin_api.EMAIL_TTL_S - 1, "person@example.com")})
+    benched = plugin_api._PoolEntrySnapshot(
+        "a", "acct", 0, "manual", "oauth", "t1", None, int((now - 60) * 1000), "anthropic",
+        exhausted_until=int(now + 3600))
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=AssertionError("called")):
+        assert asyncio.run(plugin_api._account_email("anthropic", benched)) == "person@example.com"
+    assert "anthropic:a" not in plugin_api._email_failures
+
+
+def test_email_store_reads_missing_or_malformed_files_as_empty(tmp_path):
+    path = tmp_path / "emails.json"
+    assert plugin_api._read_stored_emails(path) == {}
+    for body in ("{not json", "[]", json.dumps({"k": "v"}), json.dumps({"k": {"email": 3, "read_at": 1}})):
+        path.write_text(body, encoding="utf-8")
+        assert plugin_api._read_stored_emails(path) == {}
+    path.write_text(json.dumps({"k": {"email": "e@example.com", "read_at": 5}, "bad": None}), encoding="utf-8")
+    assert plugin_api._read_stored_emails(path) == {"k": (5.0, "e@example.com")}
 
 
 def test_account_email_skips_other_providers_dead_and_tokenless_rows_and_reads_claude_code_locally():

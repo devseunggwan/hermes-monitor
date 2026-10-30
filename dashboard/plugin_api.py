@@ -13,6 +13,8 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
+import threading
 import time
 import urllib.request
 from collections import Counter
@@ -460,6 +462,65 @@ def _claude_code_email() -> str | None:
     return email if isinstance(email, str) else None
 
 
+EMAIL_STORE = Path("cache") / "hermes-monitor" / "account-emails.json"
+_emails_loaded = False
+_email_store_lock = threading.Lock()
+
+
+def _email_store_path() -> Path:
+    return _hermes_home() / EMAIL_STORE
+
+
+def _read_stored_emails(path: Path) -> dict[str, tuple[float, str]]:
+    """Emails kept from earlier runs; a missing or malformed file reads as empty."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    stored = {}
+    for key, value in raw.items():
+        email = value.get("email") if isinstance(value, dict) else None
+        read_at = value.get("read_at") if isinstance(value, dict) else None
+        if isinstance(email, str) and isinstance(read_at, (int, float)):
+            stored[key] = (float(read_at), email)
+    return stored
+
+
+def _write_stored_emails(path: Path, emails: dict[str, tuple[float, str]]) -> None:
+    """Atomic owner-only write: the file names which login each pool entry is.
+
+    Accounts resolve concurrently, so the copy is taken under the lock: the last writer then
+    always holds every email, and an older snapshot can never replace a newer file.
+    """
+    with _email_store_lock:
+        payload = {key: {"email": email, "read_at": read_at} for key, (read_at, email) in dict(emails).items()}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # created 0600
+        os.close(descriptor)
+        temporary = Path(name)
+        try:
+            temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+async def _load_stored_emails() -> None:
+    # A benched account's token expires and a restart empties memory, so the email read while
+    # the token was valid is the only one available until the bench lifts.
+    global _emails_loaded
+    if _emails_loaded:
+        return
+    # Concurrent first callers may each read the file; that is harmless, while marking it loaded
+    # before the read lands would let them proceed without the stored emails.
+    stored = await asyncio.to_thread(_read_stored_emails, _email_store_path())
+    for key, value in stored.items():
+        _emails.setdefault(key, value)
+    _emails_loaded = True
+
+
 async def _account_email(provider: str, snapshot: _PoolEntrySnapshot) -> str | None:
     """Email *snapshot*'s credential is signed in with, when the provider can tell it (Anthropic only)."""
     if provider != "anthropic" or snapshot.dead:
@@ -468,16 +529,21 @@ async def _account_email(provider: str, snapshot: _PoolEntrySnapshot) -> str | N
         return await _limited_call(_claude_code_email)
     if not snapshot.access_token or snapshot.entry_id is None:
         return None
+    await _load_stored_emails()
     key = f"{provider}:{snapshot.entry_id}"
     now = time.time()
     cached = _emails.get(key)
     if cached is not None and now - cached[0] < EMAIL_TTL_S:
         return cached[1]
+    if _known_unreadable(snapshot):
+        return cached[1] if cached is not None else None
     if now - _email_failures.get(key, 0.0) < EMAIL_FAILURE_BACKOFF_S:
         return cached[1] if cached is not None else None
     email = await _limited_call(_fetch_anthropic_email, snapshot.access_token)
     if email:
         _emails[key] = (now, email)
+        if cached is None or cached[1] != email:
+            await _limited_call(_write_stored_emails, _email_store_path(), _emails)
         return email
     _email_failures[key] = now
     # A failed re-read keeps the email already known: it cannot have changed.
