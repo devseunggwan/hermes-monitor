@@ -1457,6 +1457,25 @@ def test_concurrent_account_reads_all_land_in_the_store():
         assert asyncio.run(resolve_all()) == [f"t{i}@example.com" for i in range(8)]
 
 
+def test_dead_and_tokenless_rows_keep_their_stored_email_without_a_profile_call():
+    store = plugin_api._email_store_path()
+    plugin_api._write_stored_emails(store, {"anthropic:a": (0.0, "dead@example.com"), "anthropic:b": (0.0, "bare@example.com")})
+    with patch.object(plugin_api, "_fetch_anthropic_email", side_effect=AssertionError("called")):
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot(dead=True))) == "dead@example.com"
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot("b", token=""))) == "bare@example.com"
+
+
+def test_an_unchanged_email_reread_persists_its_new_read_time():
+    store = plugin_api._email_store_path()
+    expired = time.time() - plugin_api.EMAIL_TTL_S - 1
+    plugin_api._write_stored_emails(store, {"anthropic:a": (expired, "person@example.com")})
+    with patch.object(plugin_api, "_fetch_anthropic_email", return_value="person@example.com") as fetch:
+        assert asyncio.run(plugin_api._account_email("anthropic", _oauth_snapshot())) == "person@example.com"
+    assert fetch.call_count == 1
+    read_at, _ = plugin_api._read_stored_emails(store)["anthropic:a"]
+    assert time.time() - read_at < 5
+
+
 def test_benched_account_with_an_expired_token_keeps_its_stored_email_without_a_profile_call():
     store = plugin_api._email_store_path()
     now = time.time()

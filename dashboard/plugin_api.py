@@ -523,31 +523,33 @@ async def _load_stored_emails() -> None:
 
 async def _account_email(provider: str, snapshot: _PoolEntrySnapshot) -> str | None:
     """Email *snapshot*'s credential is signed in with, when the provider can tell it (Anthropic only)."""
-    if provider != "anthropic" or snapshot.dead:
+    if provider != "anthropic":
         return None
-    if snapshot.source == "claude_code":
+    if snapshot.source == "claude_code" and not snapshot.dead:
         return await _limited_call(_claude_code_email)
-    if not snapshot.access_token or snapshot.entry_id is None:
+    if snapshot.entry_id is None:
         return None
     await _load_stored_emails()
     key = f"{provider}:{snapshot.entry_id}"
     now = time.time()
     cached = _emails.get(key)
+    known = cached[1] if cached is not None else None
+    # Dead, tokenless or benched-and-expired rows can only fail a read; they keep the stored email.
+    if not snapshot.access_token or _known_unreadable(snapshot):
+        return known
     if cached is not None and now - cached[0] < EMAIL_TTL_S:
-        return cached[1]
-    if _known_unreadable(snapshot):
-        return cached[1] if cached is not None else None
+        return known
     if now - _email_failures.get(key, 0.0) < EMAIL_FAILURE_BACKOFF_S:
-        return cached[1] if cached is not None else None
+        return known
     email = await _limited_call(_fetch_anthropic_email, snapshot.access_token)
     if email:
         _emails[key] = (now, email)
-        if cached is None or cached[1] != email:
-            await _limited_call(_write_stored_emails, _email_store_path(), _emails)
+        # Persisting the fresh read time keeps a restart within the once-a-day profile read.
+        await _limited_call(_write_stored_emails, _email_store_path(), _emails)
         return email
     _email_failures[key] = now
     # A failed re-read keeps the email already known: it cannot have changed.
-    return cached[1] if cached is not None else None
+    return known
 
 
 async def _collect_usage_from_snapshots(
