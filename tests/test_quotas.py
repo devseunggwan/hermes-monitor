@@ -246,6 +246,41 @@ def test_hermes_claude_labels_carry_window_lengths_and_pace():
     assert windows[0]["pace"] == {"expected_percent": 80.0, "exhausts_at": None}
 
 
+def test_claude_weekly_only_reading_shows_the_week_row():
+    # The usage endpoint can return "five_hour": null with only seven_day set.
+    for snapshot in (
+        _Snapshot([_Window("Current week", 9.0, NOW + 5 * 86_400)]),
+        {"windows": [{"label": "seven_day", "used_percent": 9, "reset_at": NOW + 5 * 86_400}]},
+    ):
+        account = _account(snapshot)
+
+        assert account["status"] == "ok"
+        assert [(w["label"], w["used_percent"], w["window_seconds"]) for w in account["windows"]] == [
+            ("week", 9.0, 604_800)
+        ]
+
+
+def test_claude_session_only_reading_shows_the_5h_row():
+    account = _account(_Snapshot([_Window("Current session", 20.0, NOW + 3600)]))
+
+    assert account["status"] == "ok"
+    assert [(w["label"], w["used_percent"]) for w in account["windows"]] == [("5h", 20.0)]
+
+
+def test_claude_reading_without_session_or_week_is_unavailable():
+    for windows in ([], [_Window("Opus week", 50.0, NOW + 86_400)]):
+        account = _account(_Snapshot(windows))
+
+        assert (account["status"], account["windows"]) == ("n/a", [])
+
+
+def test_claude_weekly_only_reading_at_full_marks_the_account_exhausted():
+    account = _account(_Snapshot([_Window("Current week", 100.0, NOW + 86_400)]))
+
+    assert account["status"] == "exhausted"
+    assert [(w["label"], w["used_percent"]) for w in account["windows"]] == [("week", 100.0)]
+
+
 def test_pace_projects_exhaustion_before_reset():
     # 2 h into a 5 h window at 60%: 30%/h leaves 40% for 80 min, well before the reset in 3 h.
     snapshot = _Snapshot([_Window("Session", 60.0, NOW + 3 * 3600)])
