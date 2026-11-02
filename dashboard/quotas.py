@@ -140,8 +140,13 @@ def _claude(source: Any) -> dict[str, Any]:
     # agent.account_usage labels Claude windows "Current session" (five_hour) and "Current week" (seven_day)
     five = next((item for key, item in indexed.items() if key in {"five_hour", "5_hour", "5h", "current_session", "session"}), None)
     week = next((item for key, item in indexed.items() if key in {"seven_day", "7_day", "week", "weekly", "current_week"}), None)
-    normalized = [_window(five, "5h", FIVE_HOURS_S), _window(week, "week", ONE_WEEK_S)]
-    if any(item is None for item in normalized):
+    # Anthropic may omit either window (five_hour has come back null with only seven_day set).
+    normalized = [
+        window
+        for window in (_window(five, "5h", FIVE_HOURS_S), _window(week, "week", ONE_WEEK_S))
+        if window is not None
+    ]
+    if not normalized:
         return {"id": "claude", "label": "Claude", "status": "n/a", "windows": []}
     return {"id": "claude", "label": "Claude", "status": "ok", "windows": normalized}
 
