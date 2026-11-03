@@ -1220,9 +1220,9 @@ def test_exhausted_row_reports_hermes_bench_until_its_reset():
                                              "exhausted_until": future, "benched_at": NOW - 86_400}]}
     account = plugin_api.build_quotas_response({"anthropic": source}, now=NOW)["providers"][0]["accounts"][0]
     assert account["status"] == "exhausted"
-    # The bench ends far beyond NOW, so the weekly limit was hit.
+    # The bench ends far beyond NOW, so the weekly limit was hit; with no reading there is no
+    # evidence of a session window, so only the week row is shown.
     assert account["windows"] == [
-        {"label": "5h", "used_percent": 0.0, "reset_at": None, "window_seconds": 18_000},
         {"label": "week", "used_percent": 100.0, "reset_at": future, "window_seconds": 604_800},
     ]
 
