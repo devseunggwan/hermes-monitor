@@ -430,6 +430,20 @@ def test_weekly_exhausted_account_without_a_session_window_shows_the_week_row_on
             ]
 
 
+def test_near_reset_bench_matching_a_weekly_only_reading_shows_the_week_row_only():
+    # Within five hours of the bench's reset, the held week window's matching reset decides the limit.
+    until = NOW + 3600
+
+    for provider, label, week in (("anthropic", "Current week", "week"), ("openai-codex", "Weekly", "Weekly")):
+        held = _Snapshot([_Window(label, 90.0, until)])
+        account = _account(held, provider, exhausted_until=until, read_at=NOW - 900, benched_at=NOW - 300)
+
+        assert account["status"] == "exhausted"
+        assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
+            (week, 100.0, until),
+        ]
+
+
 def _held(session_reset, week_reset):
     return _Snapshot([_Window("Current session", 80.0, session_reset), _Window("Current week", 90.0, week_reset)])
 
