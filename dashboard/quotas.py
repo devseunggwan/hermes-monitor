@@ -104,7 +104,8 @@ def _exhausted_windows(
     """Rows for an account Hermes benched until *until* when no later reading is held.
 
     A weekly-exhausted account cannot spend its session window, so once a full session has passed
-    since the bench that row reads 0% (before that, pre-bench usage may remain and it carries none); a
+    since the bench that row reads 0% (before that, pre-bench usage may remain and it carries none);
+    the row appears only when the held reading had a session window, since some plans have none. A
     session-exhausted account's weekly figure is unknown without a reading, so it carries none. When
     the limit that was hit cannot be told, neither row claims a figure and both show the bench's reset.
     """
@@ -114,6 +115,8 @@ def _exhausted_windows(
     session, week = labels
     hit = _hit_window_seconds(until, now, held)
     if hit == ONE_WEEK_S:
+        if not any(window.get("window_seconds") == FIVE_HOURS_S for window in held):
+            return [{"label": week, "used_percent": 100.0, "reset_at": until, "window_seconds": ONE_WEEK_S}]
         drained = isinstance(benched_at, (int, float)) and now - benched_at >= FIVE_HOURS_S
         session_row, week_row = (0.0 if drained else None, None), (100.0, until)
     elif hit == FIVE_HOURS_S:

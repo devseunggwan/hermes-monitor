@@ -380,11 +380,18 @@ def test_a_full_window_past_its_reset_does_not_mark_the_account_exhausted():
     assert account["status"] == "ok" and account["stale_since"] == NOW - 7200
 
 
+def _held_pair(provider, session_used=10.0, week_used=90.0):
+    labels = {"anthropic": ("Current session", "Current week"), "openai-codex": ("Session", "Weekly")}[provider]
+    return _Snapshot([_Window(labels[0], session_used, NOW + 3600), _Window(labels[1], week_used, NOW + 86_400)])
+
+
 def test_weekly_exhausted_account_keeps_session_at_zero_and_week_full():
     until = NOW + 2 * 86_400
 
     for provider, labels in (("anthropic", ("5h", "week")), ("openai-codex", ("Session", "Weekly"))):
-        account = _account(None, provider, exhausted_until=until, benched_at=NOW - 18_000)
+        account = _account(
+            _held_pair(provider), provider, exhausted_until=until, read_at=NOW - 20_000, benched_at=NOW - 18_000
+        )
 
         assert account["status"] == "exhausted"
         assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
@@ -395,10 +402,32 @@ def test_weekly_exhausted_account_keeps_session_at_zero_and_week_full():
 def test_weekly_exhausted_session_reads_no_figure_until_a_full_session_has_passed():
     until = NOW + 2 * 86_400
 
-    for metadata in ({"benched_at": NOW - 17_999}, {}):
-        account = _account(None, exhausted_until=until, **metadata)
+    for metadata in ({"read_at": NOW - 18_100, "benched_at": NOW - 17_999}, {"stale_since": NOW - 600}):
+        account = _account(_held_pair("anthropic"), "anthropic", exhausted_until=until, **metadata)
 
         assert [(w["label"], w["used_percent"]) for w in account["windows"]] == [("5h", None), ("week", 100.0)]
+
+
+def test_weekly_exhausted_account_without_a_session_window_shows_the_week_row_only():
+    # Plans whose usage reading has no session window (five_hour null) must not gain one when benched.
+    until = NOW + 2 * 86_400
+    weekly_only = {
+        "anthropic": _Snapshot([_Window("Current week", 90.0, NOW + 86_400)]),
+        "openai-codex": _Snapshot([_Window("Weekly", 90.0, NOW + 86_400)]),
+    }
+
+    for provider, week in (("anthropic", "week"), ("openai-codex", "Weekly")):
+        for source, metadata in (
+            (None, {"benched_at": NOW - 18_000}),
+            (None, {}),
+            (weekly_only[provider], {"read_at": NOW - 20_000, "benched_at": NOW - 18_000}),
+        ):
+            account = _account(source, provider, exhausted_until=until, **metadata)
+
+            assert account["status"] == "exhausted"
+            assert [(w["label"], w["used_percent"], w["reset_at"]) for w in account["windows"]] == [
+                (week, 100.0, until),
+            ]
 
 
 def _held(session_reset, week_reset):
