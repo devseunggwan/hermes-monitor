@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Account rows in the Quotas menu are spaced apart, so one account's window rows no longer run into the next account.
 - Fixed a weekly-exhausted Claude or Codex account showing a five-hour row it does not have: the row now appears only when the account's last reading had a five-hour window. An account benched with no reading shows the week row alone.
 - Fixed every Claude account showing `n/a` when Anthropic's usage endpoint returns only the weekly window (`five_hour` null): an account now shows the windows it has, and only an account with neither a five-hour nor a weekly window reads `n/a`.
 - A Claude account Hermes benched on a quota limit keeps its email after a Desktop restart and after its token expires: each account's email is kept in an owner-only file under the Hermes home, and a benched account with an expired token is no longer sent to the profile endpoint (that read could only fail). Account rows are named by that email instead of `account N`. A new token on the same pool entry triggers a fresh read, removed entries are dropped from the file, and concurrent backends merge their writes.
