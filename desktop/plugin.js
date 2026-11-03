@@ -785,6 +785,9 @@ function renderAccountRow(raw, index, providerIndex) {
 
   return jsx(DropdownMenuItem, {
     onSelect: event => event.preventDefault(),
+    // Inline, not Tailwind: plugin-only utilities are missing from the prebuilt bundle.
+    // The gap keeps one account's rows from reading as the next account's.
+    style: { marginBlock: '0.375rem' },
     children: jsxs('div', {
       className: 'flex w-full flex-col gap-1',
       children: [header, ...lines]
