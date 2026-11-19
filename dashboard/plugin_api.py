@@ -470,7 +470,8 @@ def _claude_code_email() -> str | None:
 
 EMAIL_STORE = Path("cache") / "hermes-monitor" / "account-emails.json"
 _emails_loaded = False
-_email_store_lock = threading.Lock()
+# One lock for every store file this process writes; the file lock covers other processes.
+_store_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -508,32 +509,43 @@ def _read_stored_emails(path: Path) -> dict[str, _StoredEmail]:
     return stored
 
 
-def _update_stored_emails(path: Path, update: Callable[[dict[str, _StoredEmail]], bool]) -> None:
-    """Read-modify-write the store under a lock every backend process shares.
+def _locked_store_update(
+    path: Path,
+    read: Callable[[Path], dict[str, Any]],
+    dump: Callable[[dict[str, Any]], dict[str, Any]],
+    update: Callable[[dict[str, Any]], bool],
+) -> None:
+    """Read-modify-write a JSON store under a lock every backend process shares.
 
     Several Desktop backends can run on one Hermes home, each with its own memory; re-reading the
     file inside the lock keeps one process from replacing what another just stored. The write is
     an atomic replace of an owner-only file.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with _email_store_lock, open(path.with_name(f".{path.name}.lock"), "a") as lock:
+    with _store_lock, open(path.with_name(f".{path.name}.lock"), "a") as lock:
         if fcntl is not None:
             fcntl.flock(lock, fcntl.LOCK_EX)
-        stored = _read_stored_emails(path)
+        stored = read(path)
         if not update(stored):
             return
-        payload = {
-            key: {"email": entry.email, "read_at": entry.read_at, "fingerprint": entry.fingerprint}
-            for key, entry in stored.items()
-        }
         descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # created 0600
         os.close(descriptor)
         temporary = Path(name)
         try:
-            temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            temporary.write_text(json.dumps(dump(stored), sort_keys=True), encoding="utf-8")
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def _update_stored_emails(path: Path, update: Callable[[dict[str, _StoredEmail]], bool]) -> None:
+    def dump(stored: dict[str, _StoredEmail]) -> dict[str, Any]:
+        return {
+            key: {"email": entry.email, "read_at": entry.read_at, "fingerprint": entry.fingerprint}
+            for key, entry in stored.items()
+        }
+
+    _locked_store_update(path, _read_stored_emails, dump, update)
 
 
 def _store_email(path: Path, key: str, entry: _StoredEmail) -> None:
