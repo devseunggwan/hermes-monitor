@@ -1661,9 +1661,36 @@ def test_a_held_reading_and_backoff_do_not_carry_over_to_another_login_on_the_sa
     assert stored["reading"] is None and stored["fingerprint"] == plugin_api._token_fingerprint("token-new")
 
 
+def test_an_email_held_from_an_earlier_token_does_not_merge_rows():
+    # Entry "relogged" signed in to another account; its profile re-read failed, so the label still
+    # carries the email stored for the old token, which is entry "other"'s account.
+    stored = plugin_api._StoredEmail(time.time(), "old@example.com", plugin_api._token_fingerprint("token-before"))
+    plugin_api._emails["anthropic:relogged"] = stored
+    plugin_api._emails["anthropic:other"] = plugin_api._StoredEmail(
+        time.time(), "old@example.com", plugin_api._token_fingerprint("token-other"))
+    relogged = plugin_api._PoolEntrySnapshot("relogged", "a", 0, "manual", "oauth", "token-after", None, None, "anthropic")
+    other = plugin_api._PoolEntrySnapshot("other", "b", 1, "manual", "oauth", "token-other", None, None, "anthropic")
+
+    assert not plugin_api._email_matches_token("anthropic", relogged, "old@example.com")
+    assert plugin_api._email_matches_token("anthropic", other, "old@example.com")
+    borrowed = dataclasses.replace(relogged, source="claude_code")
+    assert plugin_api._email_matches_token("anthropic", borrowed, "cc@example.com")
+
+    async def account_email(provider, snapshot):
+        return "old@example.com"
+
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=lambda p, token, u: _usage_snapshot(85 if token == "token-after" else 10)), \
+            patch.object(plugin_api, "_account_email", side_effect=account_email):
+        envelope = asyncio.run(plugin_api._collect_usage_from_snapshots("anthropic", [relogged, other], None, {}, active=True))
+    accounts = {account["entry_id"]: account for account in envelope["accounts"]}
+    order = plugin_api._merge_same_account(list(accounts), accounts, {key: account["active"] for key, account in accounts.items()})
+    assert order == ["relogged", "other"]
+
+
 def _merge(rows):
     order = [row["entry_id"] for row in rows]
-    accounts = {row["entry_id"]: {"account_email": "same@example.com", **row} for row in rows}
+    accounts = {row["entry_id"]: {"account_email": "same@example.com", "identity_email": "same@example.com", **row}
+                for row in rows}
     active = {entry_id: False for entry_id in order}
     merged = plugin_api._merge_same_account(order, accounts, active)
     assert len(merged) == 1
@@ -1713,6 +1740,12 @@ def test_pool_entries_signed_in_to_one_account_show_as_one_row():
             return SimpleNamespace(_USAGE_FETCHERS={"anthropic": object()}, fetch_account_usage=lambda *a, **k: None)
         raise AssertionError(name)
 
+    tokens = {"id-a": "token-a", "id-b": "token-b", "id-c": "token-c"}
+    for entry_id, email in emails.items():
+        # Read with each entry's current token, so the email may serve as the merge key.
+        plugin_api._emails[f"anthropic:{entry_id}"] = plugin_api._StoredEmail(
+            time.time(), email, plugin_api._token_fingerprint(tokens[entry_id]))
+
     async def account_email(provider, snapshot):
         return emails[snapshot.entry_id]
 
@@ -1732,6 +1765,7 @@ def test_pool_entries_signed_in_to_one_account_show_as_one_row():
     assert rows == [("same@example.com", "second", True, 2), ("other@example.com", "other", False, None)]
     assert claude["status"] == "ok" and claude["account_label"] == "second"
     assert claude["pool_size"] == 3  # pool entries, not rows
+    assert "identity_email" not in json.dumps(claude)
 
 
 def load_tests(loader, tests, pattern):

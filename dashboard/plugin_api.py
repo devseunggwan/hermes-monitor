@@ -736,6 +736,23 @@ def _merge_stored_usage() -> None:
             _last_failure[key] = failed_at
 
 
+def _email_matches_token(provider: str, snapshot: _PoolEntrySnapshot, email: str | None) -> bool:
+    """Whether *email* is known to belong to the snapshot's current credential.
+
+    ``_account_email`` falls back to the email stored for the entry when a re-read fails, and that
+    email may be the previous login's. It is fine as a label, but merging rows on it would join two
+    accounts, so only an email read with this very token (or Claude Code's own config) counts.
+    """
+    if not email:
+        return False
+    if provider == "anthropic" and snapshot.source == "claude_code" and not snapshot.dead:
+        return True
+    if snapshot.entry_id is None or not snapshot.access_token:
+        return False
+    stored = _emails.get(f"{provider}:{snapshot.entry_id}")
+    return stored is not None and stored.email == email and stored.fingerprint == _token_fingerprint(snapshot.access_token)
+
+
 async def _collect_usage_from_snapshots(
     provider: str,
     snapshots: list[_PoolEntrySnapshot],
@@ -772,6 +789,8 @@ async def _collect_usage_from_snapshots(
                 "entry_id": snapshot.entry_id,
                 "account_label": _safe_account_label(snapshot, index, secrets),
                 "account_email": emails[index],
+                # Merge key only; never part of the payload (build_quotas_response picks its fields).
+                "identity_email": emails[index] if _email_matches_token(provider, snapshot, emails[index]) else None,
                 "active": active and index == active_index,
                 "source": results[index][0],
                 "stale_since": results[index][1],
@@ -1096,16 +1115,16 @@ def _merge_same_account(
     Two entries of one login report one quota, so listing both shows an account twice. The row
     kept is the one with the newest reading (then pool order) and takes the newest bench of any
     entry; it is active when any of its entries is, and carries how many entries it stands for.
-    Rows without an email stay.
+    Rows whose email is not confirmed for their current token (``identity_email``) stay apart.
     """
     groups: dict[str, list[str]] = {}
     for entry_id in order:
-        email = accounts_by_id[entry_id].get("account_email")
+        email = accounts_by_id[entry_id].get("identity_email")
         if isinstance(email, str) and email.strip():
             groups.setdefault(email.strip().lower(), []).append(entry_id)
     merged: list[str] = []
     for entry_id in order:
-        email = accounts_by_id[entry_id].get("account_email")
+        email = accounts_by_id[entry_id].get("identity_email")
         group = groups.get(email.strip().lower()) if isinstance(email, str) and email.strip() else None
         if group is None or len(group) == 1:
             merged.append(entry_id)
