@@ -273,6 +273,7 @@ class _FakePool:
 def _clear_last_good(tmp_path):
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
+    plugin_api._held_token.clear()
     plugin_api._emails.clear()
     plugin_api._email_failures.clear()
     plugin_api._emails_loaded = False
@@ -280,10 +281,12 @@ def _clear_last_good(tmp_path):
     # The email store is redirected so a test never reads or writes the real Hermes home.
     with patch.object(plugin_api, "_fetch_anthropic_email", return_value=None), \
             patch.object(plugin_api, "_claude_code_email", return_value=None), \
-            patch.object(plugin_api, "_email_store_path", return_value=tmp_path / "account-emails.json"):
+            patch.object(plugin_api, "_email_store_path", return_value=tmp_path / "account-emails.json"), \
+            patch.object(plugin_api, "_usage_store_path", return_value=tmp_path / "account-usage.json"):
         yield
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
+    plugin_api._held_token.clear()
     plugin_api._emails.clear()
     plugin_api._email_failures.clear()
     plugin_api._emails_loaded = False
@@ -1567,6 +1570,202 @@ def test_collected_accounts_carry_their_email_into_the_quotas_payload():
     claude = _result_provider(plugin_api.build_quotas_response({"anthropic": envelope}, now=NOW), "claude")
     assert [account.get("account_email") for account in claude["accounts"]] == ["one@example.com", None]
     assert "t1" not in json.dumps(claude) and "t2" not in json.dumps(claude)
+
+
+def _forget_process_memory():
+    """What a restart or a second backend process starts with: nothing held in memory."""
+    plugin_api._last_good.clear()
+    plugin_api._last_failure.clear()
+    plugin_api._held_token.clear()
+
+
+def test_a_held_reading_survives_a_restart_and_is_served_stale_after_a_failed_read():
+    snapshot = plugin_api._PoolEntrySnapshot("a", "acct", 0, "manual", "oauth", "t1", None, None, "anthropic")
+    calls = []
+
+    def fetch(*args):
+        calls.append(args)
+        return _usage_snapshot(40) if len(calls) == 1 else None
+
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=fetch):
+        asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+        _forget_process_memory()
+        plugin_api._merge_stored_usage()
+        stored_at, _ = plugin_api._last_good["anthropic:a"]
+        plugin_api._last_good["anthropic:a"] = (stored_at - plugin_api.MIN_REFETCH_S, plugin_api._last_good["anthropic:a"][1])
+        held, stale_since = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+
+    assert len(calls) == 2
+    assert stale_since is not None
+    source = {"pool_size": 1, "accounts": [{"account_label": "a", "active": True, "source": held, "stale_since": stale_since}]}
+    account = plugin_api.build_quotas_response({"anthropic": source}, now=NOW)["providers"][0]["accounts"][0]
+    assert account["status"] == "ok" and account["stale_since"] == stale_since
+    assert [window["used_percent"] for window in account["windows"]] == [40.0, 50.0]
+
+
+def test_a_failure_backoff_is_shared_through_the_store():
+    snapshot = plugin_api._PoolEntrySnapshot("a", "acct", 0, "manual", "oauth", "t1", None, None, "anthropic")
+    calls = []
+
+    def fetch(*args):
+        calls.append(args)
+        return None
+
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=fetch):
+        asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+        _forget_process_memory()
+        plugin_api._merge_stored_usage()
+        asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None, force=True))
+
+    assert len(calls) == 1
+
+
+def test_usage_store_drops_old_and_malformed_entries(tmp_path):
+    path = tmp_path / "usage.json"
+    old = time.time() - plugin_api.LAST_GOOD_MAX_AGE_S - 60
+    path.write_text(json.dumps({
+        "anthropic:old": {"read_at": old, "reading": {"plan": None, "windows": [{"label": "x", "used_percent": 1, "reset_at": None}]}},
+        "anthropic:bad": "not an object",
+        "anthropic:empty": {"read_at": time.time(), "reading": {"windows": []}},
+    }))
+    assert set(plugin_api._read_stored_usage(path)) == {"anthropic:old"}
+    plugin_api._store_usage(path, "anthropic:new", failed_at=time.time())
+    assert set(plugin_api._read_stored_usage(path)) == {"anthropic:new"}
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    path.write_text("{not json")
+    assert plugin_api._read_stored_usage(path) == {}
+
+
+def test_a_held_reading_and_backoff_do_not_carry_over_to_another_login_on_the_same_entry():
+    first = plugin_api._PoolEntrySnapshot("a", "acct", 0, "claude_code", "oauth", "token-old", None, None, "anthropic")
+    second = dataclasses.replace(first, access_token="token-new")
+    calls = []
+
+    def fetch(provider, token, use_pool):
+        calls.append(token)
+        return _usage_snapshot(99) if token == "token-old" else None
+
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=fetch):
+        asyncio.run(plugin_api._snapshot_fetch("anthropic", first, None))
+        plugin_api._last_failure["anthropic:a"] = time.time()  # the old login is also in backoff
+        plugin_api._store_usage(plugin_api._usage_store_path(), "anthropic:a", failed_at=time.time(),
+                                fingerprint=plugin_api._token_fingerprint("token-old"))
+        _forget_process_memory()
+        plugin_api._merge_stored_usage()
+        result = asyncio.run(plugin_api._snapshot_fetch("anthropic", second, None))
+
+    # The new login is called despite the old login's backoff, and its failure shows nothing held.
+    assert calls == ["token-old", "token-new"]
+    assert result == (None, None)
+    stored = plugin_api._read_stored_usage(plugin_api._usage_store_path())["anthropic:a"]
+    assert stored["reading"] is None and stored["fingerprint"] == plugin_api._token_fingerprint("token-new")
+
+
+def test_an_email_held_from_an_earlier_token_does_not_merge_rows():
+    # Entry "relogged" signed in to another account; its profile re-read failed, so the label still
+    # carries the email stored for the old token, which is entry "other"'s account.
+    stored = plugin_api._StoredEmail(time.time(), "old@example.com", plugin_api._token_fingerprint("token-before"))
+    plugin_api._emails["anthropic:relogged"] = stored
+    plugin_api._emails["anthropic:other"] = plugin_api._StoredEmail(
+        time.time(), "old@example.com", plugin_api._token_fingerprint("token-other"))
+    relogged = plugin_api._PoolEntrySnapshot("relogged", "a", 0, "manual", "oauth", "token-after", None, None, "anthropic")
+    other = plugin_api._PoolEntrySnapshot("other", "b", 1, "manual", "oauth", "token-other", None, None, "anthropic")
+
+    assert not plugin_api._email_matches_token("anthropic", relogged, "old@example.com")
+    assert plugin_api._email_matches_token("anthropic", other, "old@example.com")
+    borrowed = dataclasses.replace(relogged, source="claude_code")
+    assert plugin_api._email_matches_token("anthropic", borrowed, "cc@example.com")
+
+    async def account_email(provider, snapshot):
+        return "old@example.com"
+
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=lambda p, token, u: _usage_snapshot(85 if token == "token-after" else 10)), \
+            patch.object(plugin_api, "_account_email", side_effect=account_email):
+        envelope = asyncio.run(plugin_api._collect_usage_from_snapshots("anthropic", [relogged, other], None, {}, active=True))
+    accounts = {account["entry_id"]: account for account in envelope["accounts"]}
+    order = plugin_api._merge_same_account(list(accounts), accounts, {key: account["active"] for key, account in accounts.items()})
+    assert order == ["relogged", "other"]
+
+
+def _merge(rows):
+    order = [row["entry_id"] for row in rows]
+    accounts = {row["entry_id"]: {"account_email": "same@example.com", "identity_email": "same@example.com", **row}
+                for row in rows}
+    active = {entry_id: False for entry_id in order}
+    merged = plugin_api._merge_same_account(order, accounts, active)
+    assert len(merged) == 1
+    return accounts[merged[0]]
+
+
+def test_merging_keeps_the_newest_reading_of_equal_rank():
+    for rows in (
+        [{"entry_id": "old", "source": _usage_snapshot(10), "read_at": NOW - 3500},
+         {"entry_id": "new", "source": _usage_snapshot(95), "read_at": NOW - 200}],
+        [{"entry_id": "new", "source": _usage_snapshot(95), "read_at": NOW - 200},
+         {"entry_id": "old", "source": _usage_snapshot(10), "read_at": NOW - 3500}],
+    ):
+        assert _merge(rows)["entry_id"] == "new"
+
+
+def test_merging_keeps_a_newer_bench_from_another_entry():
+    until = NOW + 2 * 86_400
+    row = _merge([
+        {"entry_id": "read", "source": _usage_snapshot(10), "stale_since": NOW - 3600, "read_at": NOW - 3600},
+        {"entry_id": "benched", "source": None, "exhausted_until": until, "benched_at": NOW - 600},
+    ])
+    assert row["entry_id"] == "read" and row["exhausted_until"] == until and row["benched_at"] == NOW - 600
+    account = plugin_api.build_quotas_response({"anthropic": {"pool_size": 2, "accounts": [row]}}, now=NOW)["providers"][0]["accounts"][0]
+    assert account["status"] == "exhausted" and account["estimated"] is True
+
+    # A reading taken after the bench still wins over it.
+    later = _merge([
+        {"entry_id": "read", "source": _usage_snapshot(10), "read_at": NOW - 60},
+        {"entry_id": "benched", "source": None, "exhausted_until": until, "benched_at": NOW - 600},
+    ])
+    account = plugin_api.build_quotas_response({"anthropic": {"pool_size": 2, "accounts": [later]}}, now=NOW)["providers"][0]["accounts"][0]
+    assert account["status"] == "ok" and "estimated" not in account
+
+
+def test_pool_entries_signed_in_to_one_account_show_as_one_row():
+    root = Path("/tmp/hermes-root")
+    entries = [_pool_entry("id-a", "first", "token-a", 0), _pool_entry("id-b", "second", "token-b", 1),
+               _pool_entry("id-c", "other", "token-c", 2)]
+    emails = {"id-a": "Same@example.com", "id-b": "same@example.com", "id-c": "other@example.com"}
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            registry = {"anthropic": SimpleNamespace(name="Anthropic", inference_base_url="https://api.anthropic.com")}
+            return _fake_credential_module(registry, {"anthropic": _FakePool(entries, entries[0])})
+        if name == "agent.account_usage":
+            return SimpleNamespace(_USAGE_FETCHERS={"anthropic": object()}, fetch_account_usage=lambda *a, **k: None)
+        raise AssertionError(name)
+
+    tokens = {"id-a": "token-a", "id-b": "token-b", "id-c": "token-c"}
+    for entry_id, email in emails.items():
+        # Read with each entry's current token, so the email may serve as the merge key.
+        plugin_api._emails[f"anthropic:{entry_id}"] = plugin_api._StoredEmail(
+            time.time(), email, plugin_api._token_fingerprint(tokens[entry_id]))
+
+    async def account_email(provider, snapshot):
+        return emails[snapshot.entry_id]
+
+    def fetch(provider, token, use_pool):
+        return None if token == "token-a" else _usage_snapshot(30)
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=[("default", root)]
+    ), patch.object(plugin_api, "_fetch_account_usage", side_effect=fetch), patch.object(
+        plugin_api, "_account_email", side_effect=account_email
+    ), patch.object(plugin_api, "_read_deepseek_credential", return_value=(None, None)):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+
+    claude = _result_provider(plugin_api.build_quotas_response(sources, now=NOW), "claude")
+    rows = [(a["account_email"], a["account_label"], a["active"], a.get("pool_entries")) for a in claude["accounts"]]
+    # The readable entry is kept, it is active because its twin is, and the row says it stands for two.
+    assert rows == [("same@example.com", "second", True, 2), ("other@example.com", "other", False, None)]
+    assert claude["status"] == "ok" and claude["account_label"] == "second"
+    assert claude["pool_size"] == 3  # pool entries, not rows
+    assert "identity_email" not in json.dumps(claude)
 
 
 def load_tests(loader, tests, pattern):

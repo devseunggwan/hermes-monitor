@@ -34,7 +34,7 @@ except ImportError:  # Windows: the store is then guarded within one process onl
     fcntl = None
 
 try:
-    from .quotas import build_quotas_response
+    from .quotas import build_quotas_response, reading_record
     from .workers import build_workers_response, hash_arguments
 except ImportError:  # Loaded by file path by the Hermes plugin loader: no package, no sys.path entry.
     import importlib.util as _ilu
@@ -45,7 +45,8 @@ except ImportError:  # Loaded by file path by the Hermes plugin loader: no packa
         spec.loader.exec_module(module)
         return module
 
-    build_quotas_response = _load_sibling("quotas").build_quotas_response
+    _quotas = _load_sibling("quotas")
+    build_quotas_response, reading_record = _quotas.build_quotas_response, _quotas.reading_record
     _workers = _load_sibling("workers")
     build_workers_response, hash_arguments = _workers.build_workers_response, _workers.hash_arguments
 
@@ -351,6 +352,20 @@ MIN_REFETCH_S = 120
 FAILURE_BACKOFF_S = 300
 _last_good: dict[str, tuple[float, Any]] = {}
 _last_failure: dict[str, float] = {}
+# Fingerprint of the token behind each entry's held reading and failure: an entry keeps its id
+# when its source signs in to another account, and that account's figures or backoff must not
+# carry over to the new login.
+_held_token: dict[str, str] = {}
+
+
+def _forget_other_token(key: str, token: str) -> str:
+    """Drop the held reading and backoff of *key* when they came from another token."""
+    fingerprint = _token_fingerprint(token)
+    if _held_token.get(key, fingerprint) != fingerprint:
+        _last_good.pop(key, None)
+        _last_failure.pop(key, None)
+        _held_token.pop(key, None)
+    return fingerprint
 
 
 def _recent(key: str | None, force: bool = False) -> tuple[Any, int | None] | None:
@@ -412,6 +427,7 @@ async def _snapshot_fetch(
     if shared is not None and key is not None and key in shared:
         return shared[key]
     cache_key = f"{provider}:{key}" if key is not None else None
+    fingerprint = _forget_other_token(cache_key, snapshot.access_token) if cache_key and snapshot.access_token else None
     result = _recent(cache_key, force)
     if result is None and _known_unreadable(snapshot):
         result = _remember(cache_key, None)
@@ -421,9 +437,15 @@ async def _snapshot_fetch(
             if snapshot.access_token
             else None
         )
-        if live is None and cache_key is not None and snapshot.access_token:
-            _last_failure[cache_key] = time.time()
+        if cache_key is not None and fingerprint is not None:
+            _held_token[cache_key] = fingerprint
+        if live is None and cache_key is not None and fingerprint is not None:
+            failed_at = time.time()
+            _last_failure[cache_key] = failed_at
+            await _limited_call(_persist_usage, cache_key, None, failed_at, fingerprint)
         result = _remember(cache_key, live)
+        if live is not None and cache_key is not None:
+            await _limited_call(_persist_usage, cache_key, live, None, fingerprint)
     if shared is not None and key is not None:
         shared[key] = result
     return result
@@ -470,7 +492,8 @@ def _claude_code_email() -> str | None:
 
 EMAIL_STORE = Path("cache") / "hermes-monitor" / "account-emails.json"
 _emails_loaded = False
-_email_store_lock = threading.Lock()
+# One lock for every store file this process writes; the file lock covers other processes.
+_store_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -508,32 +531,43 @@ def _read_stored_emails(path: Path) -> dict[str, _StoredEmail]:
     return stored
 
 
-def _update_stored_emails(path: Path, update: Callable[[dict[str, _StoredEmail]], bool]) -> None:
-    """Read-modify-write the store under a lock every backend process shares.
+def _locked_store_update(
+    path: Path,
+    read: Callable[[Path], dict[str, Any]],
+    dump: Callable[[dict[str, Any]], dict[str, Any]],
+    update: Callable[[dict[str, Any]], bool],
+) -> None:
+    """Read-modify-write a JSON store under a lock every backend process shares.
 
     Several Desktop backends can run on one Hermes home, each with its own memory; re-reading the
     file inside the lock keeps one process from replacing what another just stored. The write is
     an atomic replace of an owner-only file.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with _email_store_lock, open(path.with_name(f".{path.name}.lock"), "a") as lock:
+    with _store_lock, open(path.with_name(f".{path.name}.lock"), "a") as lock:
         if fcntl is not None:
             fcntl.flock(lock, fcntl.LOCK_EX)
-        stored = _read_stored_emails(path)
+        stored = read(path)
         if not update(stored):
             return
-        payload = {
-            key: {"email": entry.email, "read_at": entry.read_at, "fingerprint": entry.fingerprint}
-            for key, entry in stored.items()
-        }
         descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")  # created 0600
         os.close(descriptor)
         temporary = Path(name)
         try:
-            temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            temporary.write_text(json.dumps(dump(stored), sort_keys=True), encoding="utf-8")
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
+
+
+def _update_stored_emails(path: Path, update: Callable[[dict[str, _StoredEmail]], bool]) -> None:
+    def dump(stored: dict[str, _StoredEmail]) -> dict[str, Any]:
+        return {
+            key: {"email": entry.email, "read_at": entry.read_at, "fingerprint": entry.fingerprint}
+            for key, entry in stored.items()
+        }
+
+    _locked_store_update(path, _read_stored_emails, dump, update)
 
 
 def _store_email(path: Path, key: str, entry: _StoredEmail) -> None:
@@ -607,6 +641,118 @@ async def _account_email(provider: str, snapshot: _PoolEntrySnapshot) -> str | N
     return known
 
 
+USAGE_STORE = Path("cache") / "hermes-monitor" / "account-usage.json"
+
+
+def _usage_store_path() -> Path:
+    return _hermes_home() / USAGE_STORE
+
+
+def _read_stored_usage(path: Path) -> dict[str, dict[str, Any]]:
+    """Held readings and failure times from the store; a missing or malformed file reads as empty."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    stored: dict[str, dict[str, Any]] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        read_at, failed_at, fingerprint = value.get("read_at"), value.get("failed_at"), value.get("fingerprint")
+        reading = reading_record(value.get("reading")) if isinstance(value.get("reading"), dict) else None
+        entry = {
+            "read_at": float(read_at) if isinstance(read_at, (int, float)) and reading is not None else None,
+            "reading": reading,
+            "failed_at": float(failed_at) if isinstance(failed_at, (int, float)) else None,
+            "fingerprint": fingerprint if isinstance(fingerprint, str) else None,
+        }
+        if entry["read_at"] is not None or entry["failed_at"] is not None:
+            stored[key] = entry
+    return stored
+
+
+def _store_usage(path: Path, key: str, *, reading: dict[str, Any] | None = None, read_at: float | None = None,
+                 failed_at: float | None = None, fingerprint: str | None = None) -> None:
+    """Record one entry's newest reading or failure, dropping entries too old to be served.
+
+    A write from another token than the stored one replaces the entry: its reading and backoff
+    belong to the login that token signed in to.
+    """
+    empty = {"read_at": None, "reading": None, "failed_at": None, "fingerprint": fingerprint}
+
+    def merge(stored: dict[str, dict[str, Any]]) -> bool:
+        entry = stored.setdefault(key, dict(empty))
+        if entry.get("fingerprint") != fingerprint:
+            entry = stored[key] = dict(empty)
+        if reading is not None and read_at is not None and read_at > (entry["read_at"] or 0.0):
+            entry["read_at"], entry["reading"] = read_at, reading
+        if failed_at is not None and failed_at > (entry["failed_at"] or 0.0):
+            entry["failed_at"] = failed_at
+        horizon = time.time() - LAST_GOOD_MAX_AGE_S
+        for old in [k for k, v in stored.items() if max(v["read_at"] or 0.0, v["failed_at"] or 0.0) < horizon]:
+            del stored[old]
+        return True
+
+    _locked_store_update(path, _read_stored_usage, lambda stored: stored, merge)
+
+
+def _persist_usage(key: str, live: Any, failed_at: float | None, fingerprint: str | None) -> None:
+    """Store a live reading (with the time ``_remember`` gave it) or a failed read's time."""
+    try:
+        if failed_at is not None:
+            _store_usage(_usage_store_path(), key, failed_at=failed_at, fingerprint=fingerprint)
+            return
+        record, held = reading_record(live), _last_good.get(key)
+        if record is not None and held is not None:
+            _store_usage(_usage_store_path(), key, reading=record, read_at=held[0], fingerprint=fingerprint)
+    except OSError:
+        # The store only carries readings across processes; an unwritable cache dir must not cost
+        # this process its figures.
+        pass
+
+
+def _merge_stored_usage() -> None:
+    """Adopt readings and failures other processes (or this one before a restart) stored.
+
+    Read once per collection, so every backend on one Hermes home serves the newest held reading
+    and waits out a failure backoff another backend started instead of calling again.
+    """
+    for key, entry in _read_stored_usage(_usage_store_path()).items():
+        read_at, reading, failed_at, fingerprint = entry["read_at"], entry["reading"], entry["failed_at"], entry["fingerprint"]
+        if fingerprint != _held_token.get(key, fingerprint):
+            # Another token wrote it; the newer side wins whole, never a mix of two logins.
+            held_newest = max(_last_good.get(key, (0.0, None))[0], _last_failure.get(key, 0.0))
+            if max(read_at or 0.0, failed_at or 0.0) <= held_newest:
+                continue
+            _last_good.pop(key, None)
+            _last_failure.pop(key, None)
+        if fingerprint is not None:
+            _held_token[key] = fingerprint
+        if read_at is not None and read_at > _last_good.get(key, (0.0, None))[0]:
+            _last_good[key] = (read_at, reading)
+        if failed_at is not None and failed_at > _last_failure.get(key, 0.0):
+            _last_failure[key] = failed_at
+
+
+def _email_matches_token(provider: str, snapshot: _PoolEntrySnapshot, email: str | None) -> bool:
+    """Whether *email* is known to belong to the snapshot's current credential.
+
+    ``_account_email`` falls back to the email stored for the entry when a re-read fails, and that
+    email may be the previous login's. It is fine as a label, but merging rows on it would join two
+    accounts, so only an email read with this very token (or Claude Code's own config) counts.
+    """
+    if not email:
+        return False
+    if provider == "anthropic" and snapshot.source == "claude_code" and not snapshot.dead:
+        return True
+    if snapshot.entry_id is None or not snapshot.access_token:
+        return False
+    stored = _emails.get(f"{provider}:{snapshot.entry_id}")
+    return stored is not None and stored.email == email and stored.fingerprint == _token_fingerprint(snapshot.access_token)
+
+
 async def _collect_usage_from_snapshots(
     provider: str,
     snapshots: list[_PoolEntrySnapshot],
@@ -643,6 +789,8 @@ async def _collect_usage_from_snapshots(
                 "entry_id": snapshot.entry_id,
                 "account_label": _safe_account_label(snapshot, index, secrets),
                 "account_email": emails[index],
+                # Merge key only; never part of the payload (build_quotas_response picks its fields).
+                "identity_email": emails[index] if _email_matches_token(provider, snapshot, emails[index]) else None,
                 "active": active and index == active_index,
                 "source": results[index][0],
                 "stale_since": results[index][1],
@@ -959,6 +1107,46 @@ def _snapshot_pool_for_profile(
         _reset_secret_scope(secret_token)
 
 
+def _merge_same_account(
+    order: list[str], accounts_by_id: dict[str, dict[str, Any]], entry_active: dict[str, bool]
+) -> list[str]:
+    """Collapse pool entries signed in to one account (same email) into one row.
+
+    Two entries of one login report one quota, so listing both shows an account twice. The row
+    kept is the one with the newest reading (then pool order) and takes the newest bench of any
+    entry; it is active when any of its entries is, and carries how many entries it stands for.
+    Rows whose email is not confirmed for their current token (``identity_email``) stay apart.
+    """
+    groups: dict[str, list[str]] = {}
+    for entry_id in order:
+        email = accounts_by_id[entry_id].get("identity_email")
+        if isinstance(email, str) and email.strip():
+            groups.setdefault(email.strip().lower(), []).append(entry_id)
+    merged: list[str] = []
+    for entry_id in order:
+        email = accounts_by_id[entry_id].get("identity_email")
+        group = groups.get(email.strip().lower()) if isinstance(email, str) and email.strip() else None
+        if group is None or len(group) == 1:
+            merged.append(entry_id)
+            continue
+        if entry_id != group[0]:
+            continue  # the group's row is placed where its first entry was
+        members = group
+        kept = min(members, key=lambda member: (-(accounts_by_id[member].get("read_at") or 0.0), members.index(member)))
+        row = {**accounts_by_id[kept], "pool_entries": len(members)}
+        # A bench on any entry is the account's: carry the newest one so the transform can still
+        # weigh it against the kept reading's time.
+        benches = [accounts_by_id[m] for m in members if accounts_by_id[m].get("exhausted_until") is not None]
+        if benches:
+            bench = max(benches, key=lambda account: account.get("benched_at") or 0.0)
+            if row.get("exhausted_until") is None or (bench.get("benched_at") or 0.0) > (row.get("benched_at") or 0.0):
+                row["exhausted_until"], row["benched_at"] = bench["exhausted_until"], bench.get("benched_at")
+        accounts_by_id[kept] = row
+        entry_active[kept] = any(entry_active[member] for member in members)
+        merged.append(kept)
+    return merged
+
+
 async def _collect_usage_provider_cross_profile(
     provider: str, profiles: list[tuple[str, Path]], label: str, force: bool = False
 ) -> dict[str, Any] | None:
@@ -1024,6 +1212,8 @@ async def _collect_usage_provider_cross_profile(
         for key in [key for key in _emails if key.startswith(f"{provider}:") and key not in live_keys]:
             del _emails[key]
         await _limited_call(_prune_stored_emails, _email_store_path(), provider, live_keys)
+    pool_size = len(order)
+    order = _merge_same_account(order, accounts_by_id, entry_active)
     accounts: list[dict[str, Any]] = []
     # Two pool entries can carry the same label (the same name given to two logins); the entry id
     # tells their rows apart. Ids are random pool keys, not secrets.
@@ -1045,7 +1235,7 @@ async def _collect_usage_provider_cross_profile(
     if not accounts and not failures:
         return None
     return {
-        "pool_size": len(order),
+        "pool_size": pool_size,
         "provider_label": label,
         "accounts": accounts,
         "failures": sorted(failures)[:4],
@@ -1071,6 +1261,7 @@ async def _collect_quota_sources(force: bool = False) -> dict[str, Any]:
     supported = set(getattr(account_usage_module, "_USAGE_FETCHERS", {}))
     deepseek_key, deepseek_source = _read_deepseek_credential()
     profiles = _enumerate_profiles()
+    await asyncio.to_thread(_merge_stored_usage)
 
     providers: list[tuple[str, str]] = []
     for provider in sorted(set(registry) | supported):
