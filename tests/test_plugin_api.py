@@ -273,6 +273,7 @@ class _FakePool:
 def _clear_last_good(tmp_path):
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
+    plugin_api._held_token.clear()
     plugin_api._emails.clear()
     plugin_api._email_failures.clear()
     plugin_api._emails_loaded = False
@@ -285,6 +286,7 @@ def _clear_last_good(tmp_path):
         yield
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
+    plugin_api._held_token.clear()
     plugin_api._emails.clear()
     plugin_api._email_failures.clear()
     plugin_api._emails_loaded = False
@@ -1574,6 +1576,7 @@ def _forget_process_memory():
     """What a restart or a second backend process starts with: nothing held in memory."""
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
+    plugin_api._held_token.clear()
 
 
 def test_a_held_reading_survives_a_restart_and_is_served_stale_after_a_failed_read():
@@ -1631,6 +1634,31 @@ def test_usage_store_drops_old_and_malformed_entries(tmp_path):
     assert oct(path.stat().st_mode & 0o777) == "0o600"
     path.write_text("{not json")
     assert plugin_api._read_stored_usage(path) == {}
+
+
+def test_a_held_reading_and_backoff_do_not_carry_over_to_another_login_on_the_same_entry():
+    first = plugin_api._PoolEntrySnapshot("a", "acct", 0, "claude_code", "oauth", "token-old", None, None, "anthropic")
+    second = dataclasses.replace(first, access_token="token-new")
+    calls = []
+
+    def fetch(provider, token, use_pool):
+        calls.append(token)
+        return _usage_snapshot(99) if token == "token-old" else None
+
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=fetch):
+        asyncio.run(plugin_api._snapshot_fetch("anthropic", first, None))
+        plugin_api._last_failure["anthropic:a"] = time.time()  # the old login is also in backoff
+        plugin_api._store_usage(plugin_api._usage_store_path(), "anthropic:a", failed_at=time.time(),
+                                fingerprint=plugin_api._token_fingerprint("token-old"))
+        _forget_process_memory()
+        plugin_api._merge_stored_usage()
+        result = asyncio.run(plugin_api._snapshot_fetch("anthropic", second, None))
+
+    # The new login is called despite the old login's backoff, and its failure shows nothing held.
+    assert calls == ["token-old", "token-new"]
+    assert result == (None, None)
+    stored = plugin_api._read_stored_usage(plugin_api._usage_store_path())["anthropic:a"]
+    assert stored["reading"] is None and stored["fingerprint"] == plugin_api._token_fingerprint("token-new")
 
 
 def test_pool_entries_signed_in_to_one_account_show_as_one_row():

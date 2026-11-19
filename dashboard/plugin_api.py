@@ -352,6 +352,20 @@ MIN_REFETCH_S = 120
 FAILURE_BACKOFF_S = 300
 _last_good: dict[str, tuple[float, Any]] = {}
 _last_failure: dict[str, float] = {}
+# Fingerprint of the token behind each entry's held reading and failure: an entry keeps its id
+# when its source signs in to another account, and that account's figures or backoff must not
+# carry over to the new login.
+_held_token: dict[str, str] = {}
+
+
+def _forget_other_token(key: str, token: str) -> str:
+    """Drop the held reading and backoff of *key* when they came from another token."""
+    fingerprint = _token_fingerprint(token)
+    if _held_token.get(key, fingerprint) != fingerprint:
+        _last_good.pop(key, None)
+        _last_failure.pop(key, None)
+        _held_token.pop(key, None)
+    return fingerprint
 
 
 def _recent(key: str | None, force: bool = False) -> tuple[Any, int | None] | None:
@@ -413,6 +427,7 @@ async def _snapshot_fetch(
     if shared is not None and key is not None and key in shared:
         return shared[key]
     cache_key = f"{provider}:{key}" if key is not None else None
+    fingerprint = _forget_other_token(cache_key, snapshot.access_token) if cache_key and snapshot.access_token else None
     result = _recent(cache_key, force)
     if result is None and _known_unreadable(snapshot):
         result = _remember(cache_key, None)
@@ -422,13 +437,15 @@ async def _snapshot_fetch(
             if snapshot.access_token
             else None
         )
-        if live is None and cache_key is not None and snapshot.access_token:
+        if cache_key is not None and fingerprint is not None:
+            _held_token[cache_key] = fingerprint
+        if live is None and cache_key is not None and fingerprint is not None:
             failed_at = time.time()
             _last_failure[cache_key] = failed_at
-            await _limited_call(_persist_usage, cache_key, None, failed_at)
+            await _limited_call(_persist_usage, cache_key, None, failed_at, fingerprint)
         result = _remember(cache_key, live)
         if live is not None and cache_key is not None:
-            await _limited_call(_persist_usage, cache_key, live, None)
+            await _limited_call(_persist_usage, cache_key, live, None, fingerprint)
     if shared is not None and key is not None:
         shared[key] = result
     return result
@@ -643,12 +660,13 @@ def _read_stored_usage(path: Path) -> dict[str, dict[str, Any]]:
     for key, value in raw.items():
         if not isinstance(key, str) or not isinstance(value, dict):
             continue
-        read_at, failed_at = value.get("read_at"), value.get("failed_at")
+        read_at, failed_at, fingerprint = value.get("read_at"), value.get("failed_at"), value.get("fingerprint")
         reading = reading_record(value.get("reading")) if isinstance(value.get("reading"), dict) else None
         entry = {
             "read_at": float(read_at) if isinstance(read_at, (int, float)) and reading is not None else None,
             "reading": reading,
             "failed_at": float(failed_at) if isinstance(failed_at, (int, float)) else None,
+            "fingerprint": fingerprint if isinstance(fingerprint, str) else None,
         }
         if entry["read_at"] is not None or entry["failed_at"] is not None:
             stored[key] = entry
@@ -656,10 +674,18 @@ def _read_stored_usage(path: Path) -> dict[str, dict[str, Any]]:
 
 
 def _store_usage(path: Path, key: str, *, reading: dict[str, Any] | None = None, read_at: float | None = None,
-                 failed_at: float | None = None) -> None:
-    """Record one entry's newest reading or failure, dropping entries too old to be served."""
+                 failed_at: float | None = None, fingerprint: str | None = None) -> None:
+    """Record one entry's newest reading or failure, dropping entries too old to be served.
+
+    A write from another token than the stored one replaces the entry: its reading and backoff
+    belong to the login that token signed in to.
+    """
+    empty = {"read_at": None, "reading": None, "failed_at": None, "fingerprint": fingerprint}
+
     def merge(stored: dict[str, dict[str, Any]]) -> bool:
-        entry = stored.setdefault(key, {"read_at": None, "reading": None, "failed_at": None})
+        entry = stored.setdefault(key, dict(empty))
+        if entry.get("fingerprint") != fingerprint:
+            entry = stored[key] = dict(empty)
         if reading is not None and read_at is not None and read_at > (entry["read_at"] or 0.0):
             entry["read_at"], entry["reading"] = read_at, reading
         if failed_at is not None and failed_at > (entry["failed_at"] or 0.0):
@@ -672,15 +698,15 @@ def _store_usage(path: Path, key: str, *, reading: dict[str, Any] | None = None,
     _locked_store_update(path, _read_stored_usage, lambda stored: stored, merge)
 
 
-def _persist_usage(key: str, live: Any, failed_at: float | None) -> None:
+def _persist_usage(key: str, live: Any, failed_at: float | None, fingerprint: str | None) -> None:
     """Store a live reading (with the time ``_remember`` gave it) or a failed read's time."""
     try:
         if failed_at is not None:
-            _store_usage(_usage_store_path(), key, failed_at=failed_at)
+            _store_usage(_usage_store_path(), key, failed_at=failed_at, fingerprint=fingerprint)
             return
         record, held = reading_record(live), _last_good.get(key)
         if record is not None and held is not None:
-            _store_usage(_usage_store_path(), key, reading=record, read_at=held[0])
+            _store_usage(_usage_store_path(), key, reading=record, read_at=held[0], fingerprint=fingerprint)
     except OSError:
         # The store only carries readings across processes; an unwritable cache dir must not cost
         # this process its figures.
@@ -694,7 +720,16 @@ def _merge_stored_usage() -> None:
     and waits out a failure backoff another backend started instead of calling again.
     """
     for key, entry in _read_stored_usage(_usage_store_path()).items():
-        read_at, reading, failed_at = entry["read_at"], entry["reading"], entry["failed_at"]
+        read_at, reading, failed_at, fingerprint = entry["read_at"], entry["reading"], entry["failed_at"], entry["fingerprint"]
+        if fingerprint != _held_token.get(key, fingerprint):
+            # Another token wrote it; the newer side wins whole, never a mix of two logins.
+            held_newest = max(_last_good.get(key, (0.0, None))[0], _last_failure.get(key, 0.0))
+            if max(read_at or 0.0, failed_at or 0.0) <= held_newest:
+                continue
+            _last_good.pop(key, None)
+            _last_failure.pop(key, None)
+        if fingerprint is not None:
+            _held_token[key] = fingerprint
         if read_at is not None and read_at > _last_good.get(key, (0.0, None))[0]:
             _last_good[key] = (read_at, reading)
         if failed_at is not None and failed_at > _last_failure.get(key, 0.0):
