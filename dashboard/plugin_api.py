@@ -1053,6 +1053,44 @@ def _snapshot_pool_for_profile(
         _reset_secret_scope(secret_token)
 
 
+def _reading_rank(account: dict[str, Any]) -> int:
+    """How much an account row knows: a current reading, a held one, a bench, nothing."""
+    if account.get("source") is not None:
+        return 0 if account.get("stale_since") is None else 1
+    return 2 if account.get("exhausted_until") is not None else 3
+
+
+def _merge_same_account(
+    order: list[str], accounts_by_id: dict[str, dict[str, Any]], entry_active: dict[str, bool]
+) -> list[str]:
+    """Collapse pool entries signed in to one account (same email) into one row.
+
+    Two entries of one login report one quota, so listing both shows an account twice. The row
+    kept is the one that knows the most (``_reading_rank``, then pool order); it is active when any
+    of its entries is, and carries how many entries it stands for. Rows without an email stay.
+    """
+    groups: dict[str, list[str]] = {}
+    for entry_id in order:
+        email = accounts_by_id[entry_id].get("account_email")
+        if isinstance(email, str) and email.strip():
+            groups.setdefault(email.strip().lower(), []).append(entry_id)
+    merged: list[str] = []
+    for entry_id in order:
+        email = accounts_by_id[entry_id].get("account_email")
+        group = groups.get(email.strip().lower()) if isinstance(email, str) and email.strip() else None
+        if group is None or len(group) == 1:
+            merged.append(entry_id)
+            continue
+        if entry_id != group[0]:
+            continue  # the group's row is placed where its first entry was
+        members = group
+        kept = min(members, key=lambda member: (_reading_rank(accounts_by_id[member]), members.index(member)))
+        accounts_by_id[kept] = {**accounts_by_id[kept], "pool_entries": len(members)}
+        entry_active[kept] = any(entry_active[member] for member in members)
+        merged.append(kept)
+    return merged
+
+
 async def _collect_usage_provider_cross_profile(
     provider: str, profiles: list[tuple[str, Path]], label: str, force: bool = False
 ) -> dict[str, Any] | None:
@@ -1118,6 +1156,8 @@ async def _collect_usage_provider_cross_profile(
         for key in [key for key in _emails if key.startswith(f"{provider}:") and key not in live_keys]:
             del _emails[key]
         await _limited_call(_prune_stored_emails, _email_store_path(), provider, live_keys)
+    pool_size = len(order)
+    order = _merge_same_account(order, accounts_by_id, entry_active)
     accounts: list[dict[str, Any]] = []
     # Two pool entries can carry the same label (the same name given to two logins); the entry id
     # tells their rows apart. Ids are random pool keys, not secrets.
@@ -1139,7 +1179,7 @@ async def _collect_usage_provider_cross_profile(
     if not accounts and not failures:
         return None
     return {
-        "pool_size": len(order),
+        "pool_size": pool_size,
         "provider_label": label,
         "accounts": accounts,
         "failures": sorted(failures)[:4],

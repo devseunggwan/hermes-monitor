@@ -477,6 +477,8 @@ function renderWindowBar(win) {
 }
 
 function footerPoolSize(p) {
+  // Rows, not pool entries: entries signed in to one account are one row (`pool_entries`).
+  if (Array.isArray(p?.accounts) && p.accounts.length > 0) return p.accounts.length
   return Number.isFinite(p?.pool_size) ? Math.max(0, Math.floor(p.pool_size)) : 0
 }
 
@@ -662,6 +664,7 @@ function accountView(account, index) {
     active: a.active === true,
     ok: statusOk(a.status),
     exhausted: a.status === 'exhausted',
+    poolEntries: Number.isInteger(a.pool_entries) && a.pool_entries > 1 ? a.pool_entries : null,
     staleSince: Number.isFinite(a.stale_since) ? a.stale_since : null,
     // Non-object window entries are dropped here: a malformed payload must never
     // throw while the statusbar is rendering.
@@ -757,6 +760,14 @@ function renderAccountRow(raw, index, providerIndex) {
             style: { lineHeight: 1.3, whiteSpace: 'nowrap' },
             children: account.exhausted ? '· exhausted' : `· cached ${formatResetTime(account.staleSince)}`
           }, 'state')
+        : null,
+      account.poolEntries
+        ? jsx('span', {
+            className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+            style: { lineHeight: 1.3, whiteSpace: 'nowrap' },
+            title: 'Pool entries signed in to this account',
+            children: `· ${account.poolEntries} entries`
+          }, 'entries')
         : null,
       account.active
         ? jsx('span', {

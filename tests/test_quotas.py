@@ -495,6 +495,12 @@ def test_pace_is_omitted_for_cached_and_exhausted_accounts():
     assert all("pace" not in window for window in exhausted["windows"])
 
 
+def test_pool_entries_pass_through_only_when_a_row_stands_for_several():
+    assert _account(_hermes_claude(), pool_entries=2)["pool_entries"] == 2
+    for value in (1, 0, True, "2", None):
+        assert "pool_entries" not in _account(_hermes_claude(), pool_entries=value)
+
+
 def test_reading_record_keeps_what_the_transforms_read_and_round_trips():
     from datetime import datetime, timezone
 

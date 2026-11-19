@@ -1633,6 +1633,41 @@ def test_usage_store_drops_old_and_malformed_entries(tmp_path):
     assert plugin_api._read_stored_usage(path) == {}
 
 
+def test_pool_entries_signed_in_to_one_account_show_as_one_row():
+    root = Path("/tmp/hermes-root")
+    entries = [_pool_entry("id-a", "first", "token-a", 0), _pool_entry("id-b", "second", "token-b", 1),
+               _pool_entry("id-c", "other", "token-c", 2)]
+    emails = {"id-a": "Same@example.com", "id-b": "same@example.com", "id-c": "other@example.com"}
+
+    def fake_import(name):
+        if name == "agent.credential_pool":
+            registry = {"anthropic": SimpleNamespace(name="Anthropic", inference_base_url="https://api.anthropic.com")}
+            return _fake_credential_module(registry, {"anthropic": _FakePool(entries, entries[0])})
+        if name == "agent.account_usage":
+            return SimpleNamespace(_USAGE_FETCHERS={"anthropic": object()}, fetch_account_usage=lambda *a, **k: None)
+        raise AssertionError(name)
+
+    async def account_email(provider, snapshot):
+        return emails[snapshot.entry_id]
+
+    def fetch(provider, token, use_pool):
+        return None if token == "token-a" else _usage_snapshot(30)
+
+    with patch.object(plugin_api.importlib, "import_module", side_effect=fake_import), patch.object(
+        plugin_api, "_enumerate_profiles", return_value=[("default", root)]
+    ), patch.object(plugin_api, "_fetch_account_usage", side_effect=fetch), patch.object(
+        plugin_api, "_account_email", side_effect=account_email
+    ), patch.object(plugin_api, "_read_deepseek_credential", return_value=(None, None)):
+        sources = asyncio.run(plugin_api._collect_quota_sources())
+
+    claude = _result_provider(plugin_api.build_quotas_response(sources, now=NOW), "claude")
+    rows = [(a["account_email"], a["account_label"], a["active"], a.get("pool_entries")) for a in claude["accounts"]]
+    # The readable entry is kept, it is active because its twin is, and the row says it stands for two.
+    assert rows == [("same@example.com", "second", True, 2), ("other@example.com", "other", False, None)]
+    assert claude["status"] == "ok" and claude["account_label"] == "second"
+    assert claude["pool_size"] == 3  # pool entries, not rows
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     for name, value in globals().items():

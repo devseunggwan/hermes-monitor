@@ -269,6 +269,9 @@ def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> di
         result["windows"] = [_with_pace(window, sampled_at) for window in windows]
     if stale_since is not None and status == "ok":
         result["stale_since"] = stale_since
+    pool_entries = metadata.get("pool_entries")
+    if isinstance(pool_entries, int) and not isinstance(pool_entries, bool) and pool_entries > 1:
+        result["pool_entries"] = pool_entries
     profile = metadata.get("profile")
     if isinstance(profile, str) and profile.strip() and "@" not in profile and len(profile) <= 64:
         result["profile"] = profile.strip()
