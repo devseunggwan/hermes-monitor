@@ -244,11 +244,14 @@ def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> di
         superseded = read_at < benched_at
     else:
         superseded = stale_since is not None
+    estimated = False
     if exhausted_until is not None and (status == "n/a" or superseded):
         # Hermes benched this account on a quota 429 until a known reset, and the held figures
         # predate that bench (or there are none). A reading taken after the bench wins, even cached.
         stale_since = None
         status, windows = "exhausted", _exhausted_windows(normalized["id"], exhausted_until, now, windows, benched_at)
+        # These rows come from the bench, not from a usage reading; the menu must not show them as measured.
+        estimated = True
     if status == "ok" and _limit_reached(windows, now, held=stale_since is not None):
         # A window read at 100% is a hit limit whether or not Hermes has benched the account; usage
         # cannot fall before that window resets, so held figures still tell it while the reset is ahead.
@@ -269,6 +272,8 @@ def _account(raw: Any, transform: Any, index: int, now: int | None = None) -> di
         result["windows"] = [_with_pace(window, sampled_at) for window in windows]
     if stale_since is not None and status == "ok":
         result["stale_since"] = stale_since
+    if estimated:
+        result["estimated"] = True
     pool_entries = metadata.get("pool_entries")
     if isinstance(pool_entries, int) and not isinstance(pool_entries, bool) and pool_entries > 1:
         result["pool_entries"] = pool_entries

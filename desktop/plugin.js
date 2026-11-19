@@ -664,6 +664,8 @@ function accountView(account, index) {
     active: a.active === true,
     ok: statusOk(a.status),
     exhausted: a.status === 'exhausted',
+    // Built from Hermes's bench record because no usage reading was available.
+    estimated: a.estimated === true,
     poolEntries: Number.isInteger(a.pool_entries) && a.pool_entries > 1 ? a.pool_entries : null,
     staleSince: Number.isFinite(a.stale_since) ? a.stale_since : null,
     // Non-object window entries are dropped here: a malformed payload must never
@@ -758,7 +760,10 @@ function renderAccountRow(raw, index, providerIndex) {
         ? jsx('span', {
             className: 'text-[0.625rem] text-(--ui-text-quaternary)',
             style: { lineHeight: 1.3, whiteSpace: 'nowrap' },
-            children: account.exhausted ? '· exhausted' : `· cached ${formatResetTime(account.staleSince)}`
+            title: account.estimated ? 'No usage reading: figures come from the limit Hermes recorded' : undefined,
+            children: account.exhausted
+              ? (account.estimated ? '· exhausted (estimated)' : '· exhausted')
+              : `· cached ${formatResetTime(account.staleSince)}`
           }, 'state')
         : null,
       account.poolEntries

@@ -495,6 +495,25 @@ def test_pace_is_omitted_for_cached_and_exhausted_accounts():
     assert all("pace" not in window for window in exhausted["windows"])
 
 
+def test_a_benched_row_without_a_reading_is_marked_estimated():
+    until = NOW + 2 * 86_400
+    benched = _account(None, exhausted_until=until)
+    assert benched["status"] == "exhausted" and benched["estimated"] is True
+
+    # A held reading taken before the bench is superseded by it: still an estimate.
+    superseded = _account(_held_pair("anthropic"), exhausted_until=until, read_at=NOW - 20_000, benched_at=NOW - 18_000)
+    assert superseded["estimated"] is True
+
+
+def test_a_measured_full_window_is_not_marked_estimated():
+    full = _account(_Snapshot([_Window("Current week", 100.0, NOW + 86_400)]))
+    assert full["status"] == "exhausted" and "estimated" not in full
+    # A reading taken after the bench wins over it, so it is measured too.
+    after = _account(_Snapshot([_Window("Current week", 100.0, NOW + 86_400)]), exhausted_until=NOW + 86_400,
+                     read_at=NOW - 10, benched_at=NOW - 600)
+    assert "estimated" not in after
+
+
 def test_pool_entries_pass_through_only_when_a_row_stands_for_several():
     assert _account(_hermes_claude(), pool_entries=2)["pool_entries"] == 2
     for value in (1, 0, True, "2", None):
