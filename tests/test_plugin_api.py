@@ -280,7 +280,8 @@ def _clear_last_good(tmp_path):
     # The email store is redirected so a test never reads or writes the real Hermes home.
     with patch.object(plugin_api, "_fetch_anthropic_email", return_value=None), \
             patch.object(plugin_api, "_claude_code_email", return_value=None), \
-            patch.object(plugin_api, "_email_store_path", return_value=tmp_path / "account-emails.json"):
+            patch.object(plugin_api, "_email_store_path", return_value=tmp_path / "account-emails.json"), \
+            patch.object(plugin_api, "_usage_store_path", return_value=tmp_path / "account-usage.json"):
         yield
     plugin_api._last_good.clear()
     plugin_api._last_failure.clear()
@@ -1567,6 +1568,69 @@ def test_collected_accounts_carry_their_email_into_the_quotas_payload():
     claude = _result_provider(plugin_api.build_quotas_response({"anthropic": envelope}, now=NOW), "claude")
     assert [account.get("account_email") for account in claude["accounts"]] == ["one@example.com", None]
     assert "t1" not in json.dumps(claude) and "t2" not in json.dumps(claude)
+
+
+def _forget_process_memory():
+    """What a restart or a second backend process starts with: nothing held in memory."""
+    plugin_api._last_good.clear()
+    plugin_api._last_failure.clear()
+
+
+def test_a_held_reading_survives_a_restart_and_is_served_stale_after_a_failed_read():
+    snapshot = plugin_api._PoolEntrySnapshot("a", "acct", 0, "manual", "oauth", "t1", None, None, "anthropic")
+    calls = []
+
+    def fetch(*args):
+        calls.append(args)
+        return _usage_snapshot(40) if len(calls) == 1 else None
+
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=fetch):
+        asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+        _forget_process_memory()
+        plugin_api._merge_stored_usage()
+        stored_at, _ = plugin_api._last_good["anthropic:a"]
+        plugin_api._last_good["anthropic:a"] = (stored_at - plugin_api.MIN_REFETCH_S, plugin_api._last_good["anthropic:a"][1])
+        held, stale_since = asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+
+    assert len(calls) == 2
+    assert stale_since is not None
+    source = {"pool_size": 1, "accounts": [{"account_label": "a", "active": True, "source": held, "stale_since": stale_since}]}
+    account = plugin_api.build_quotas_response({"anthropic": source}, now=NOW)["providers"][0]["accounts"][0]
+    assert account["status"] == "ok" and account["stale_since"] == stale_since
+    assert [window["used_percent"] for window in account["windows"]] == [40.0, 50.0]
+
+
+def test_a_failure_backoff_is_shared_through_the_store():
+    snapshot = plugin_api._PoolEntrySnapshot("a", "acct", 0, "manual", "oauth", "t1", None, None, "anthropic")
+    calls = []
+
+    def fetch(*args):
+        calls.append(args)
+        return None
+
+    with patch.object(plugin_api, "_fetch_account_usage", side_effect=fetch):
+        asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None))
+        _forget_process_memory()
+        plugin_api._merge_stored_usage()
+        asyncio.run(plugin_api._snapshot_fetch("anthropic", snapshot, None, force=True))
+
+    assert len(calls) == 1
+
+
+def test_usage_store_drops_old_and_malformed_entries(tmp_path):
+    path = tmp_path / "usage.json"
+    old = time.time() - plugin_api.LAST_GOOD_MAX_AGE_S - 60
+    path.write_text(json.dumps({
+        "anthropic:old": {"read_at": old, "reading": {"plan": None, "windows": [{"label": "x", "used_percent": 1, "reset_at": None}]}},
+        "anthropic:bad": "not an object",
+        "anthropic:empty": {"read_at": time.time(), "reading": {"windows": []}},
+    }))
+    assert set(plugin_api._read_stored_usage(path)) == {"anthropic:old"}
+    plugin_api._store_usage(path, "anthropic:new", failed_at=time.time())
+    assert set(plugin_api._read_stored_usage(path)) == {"anthropic:new"}
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    path.write_text("{not json")
+    assert plugin_api._read_stored_usage(path) == {}
 
 
 def load_tests(loader, tests, pattern):

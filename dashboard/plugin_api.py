@@ -34,7 +34,7 @@ except ImportError:  # Windows: the store is then guarded within one process onl
     fcntl = None
 
 try:
-    from .quotas import build_quotas_response
+    from .quotas import build_quotas_response, reading_record
     from .workers import build_workers_response, hash_arguments
 except ImportError:  # Loaded by file path by the Hermes plugin loader: no package, no sys.path entry.
     import importlib.util as _ilu
@@ -45,7 +45,8 @@ except ImportError:  # Loaded by file path by the Hermes plugin loader: no packa
         spec.loader.exec_module(module)
         return module
 
-    build_quotas_response = _load_sibling("quotas").build_quotas_response
+    _quotas = _load_sibling("quotas")
+    build_quotas_response, reading_record = _quotas.build_quotas_response, _quotas.reading_record
     _workers = _load_sibling("workers")
     build_workers_response, hash_arguments = _workers.build_workers_response, _workers.hash_arguments
 
@@ -422,8 +423,12 @@ async def _snapshot_fetch(
             else None
         )
         if live is None and cache_key is not None and snapshot.access_token:
-            _last_failure[cache_key] = time.time()
+            failed_at = time.time()
+            _last_failure[cache_key] = failed_at
+            await _limited_call(_persist_usage, cache_key, None, failed_at)
         result = _remember(cache_key, live)
+        if live is not None and cache_key is not None:
+            await _limited_call(_persist_usage, cache_key, live, None)
     if shared is not None and key is not None:
         shared[key] = result
     return result
@@ -617,6 +622,83 @@ async def _account_email(provider: str, snapshot: _PoolEntrySnapshot) -> str | N
     _email_failures[key] = now
     # A failed re-read keeps the email already known.
     return known
+
+
+USAGE_STORE = Path("cache") / "hermes-monitor" / "account-usage.json"
+
+
+def _usage_store_path() -> Path:
+    return _hermes_home() / USAGE_STORE
+
+
+def _read_stored_usage(path: Path) -> dict[str, dict[str, Any]]:
+    """Held readings and failure times from the store; a missing or malformed file reads as empty."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    stored: dict[str, dict[str, Any]] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        read_at, failed_at = value.get("read_at"), value.get("failed_at")
+        reading = reading_record(value.get("reading")) if isinstance(value.get("reading"), dict) else None
+        entry = {
+            "read_at": float(read_at) if isinstance(read_at, (int, float)) and reading is not None else None,
+            "reading": reading,
+            "failed_at": float(failed_at) if isinstance(failed_at, (int, float)) else None,
+        }
+        if entry["read_at"] is not None or entry["failed_at"] is not None:
+            stored[key] = entry
+    return stored
+
+
+def _store_usage(path: Path, key: str, *, reading: dict[str, Any] | None = None, read_at: float | None = None,
+                 failed_at: float | None = None) -> None:
+    """Record one entry's newest reading or failure, dropping entries too old to be served."""
+    def merge(stored: dict[str, dict[str, Any]]) -> bool:
+        entry = stored.setdefault(key, {"read_at": None, "reading": None, "failed_at": None})
+        if reading is not None and read_at is not None and read_at > (entry["read_at"] or 0.0):
+            entry["read_at"], entry["reading"] = read_at, reading
+        if failed_at is not None and failed_at > (entry["failed_at"] or 0.0):
+            entry["failed_at"] = failed_at
+        horizon = time.time() - LAST_GOOD_MAX_AGE_S
+        for old in [k for k, v in stored.items() if max(v["read_at"] or 0.0, v["failed_at"] or 0.0) < horizon]:
+            del stored[old]
+        return True
+
+    _locked_store_update(path, _read_stored_usage, lambda stored: stored, merge)
+
+
+def _persist_usage(key: str, live: Any, failed_at: float | None) -> None:
+    """Store a live reading (with the time ``_remember`` gave it) or a failed read's time."""
+    try:
+        if failed_at is not None:
+            _store_usage(_usage_store_path(), key, failed_at=failed_at)
+            return
+        record, held = reading_record(live), _last_good.get(key)
+        if record is not None and held is not None:
+            _store_usage(_usage_store_path(), key, reading=record, read_at=held[0])
+    except OSError:
+        # The store only carries readings across processes; an unwritable cache dir must not cost
+        # this process its figures.
+        pass
+
+
+def _merge_stored_usage() -> None:
+    """Adopt readings and failures other processes (or this one before a restart) stored.
+
+    Read once per collection, so every backend on one Hermes home serves the newest held reading
+    and waits out a failure backoff another backend started instead of calling again.
+    """
+    for key, entry in _read_stored_usage(_usage_store_path()).items():
+        read_at, reading, failed_at = entry["read_at"], entry["reading"], entry["failed_at"]
+        if read_at is not None and read_at > _last_good.get(key, (0.0, None))[0]:
+            _last_good[key] = (read_at, reading)
+        if failed_at is not None and failed_at > _last_failure.get(key, 0.0):
+            _last_failure[key] = failed_at
 
 
 async def _collect_usage_from_snapshots(
@@ -1083,6 +1165,7 @@ async def _collect_quota_sources(force: bool = False) -> dict[str, Any]:
     supported = set(getattr(account_usage_module, "_USAGE_FETCHERS", {}))
     deepseek_key, deepseek_source = _read_deepseek_credential()
     profiles = _enumerate_profiles()
+    await asyncio.to_thread(_merge_stored_usage)
 
     providers: list[tuple[str, str]] = []
     for provider in sorted(set(registry) | supported):

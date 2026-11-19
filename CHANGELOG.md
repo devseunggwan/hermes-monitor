@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A failed usage read (e.g. the endpoint's 429) now falls back to the last good figures after a Desktop restart and in every backend on one Hermes home: each account's last reading and last failed read are kept in an owner-only file under the Hermes home (`cache/hermes-monitor/account-usage.json`, entries older than six hours dropped). Backends also share the five-minute backoff after a failed read, so a second backend no longer calls an account another backend just saw fail.
 - Account rows in the Quotas menu are spaced apart, so one account's window rows no longer run into the next account.
 - Fixed a weekly-exhausted Claude or Codex account showing a five-hour row it does not have: the row now appears only when the account's last reading had a five-hour window. An account benched with no reading shows the week row alone.
 - Fixed every Claude account showing `n/a` when Anthropic's usage endpoint returns only the weekly window (`five_hour` null): an account now shows the windows it has, and only an account with neither a five-hour nor a weekly window reads `n/a`.

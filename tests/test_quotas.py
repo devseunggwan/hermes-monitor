@@ -495,6 +495,22 @@ def test_pace_is_omitted_for_cached_and_exhausted_accounts():
     assert all("pace" not in window for window in exhausted["windows"])
 
 
+def test_reading_record_keeps_what_the_transforms_read_and_round_trips():
+    from datetime import datetime, timezone
+
+    from dashboard.quotas import reading_record
+
+    reset = datetime.fromtimestamp(NOW + 3600, tz=timezone.utc)
+    snapshot = _Snapshot([_Window("Current session", 20.0, reset), _Window("Current week", "bad", None)])
+    snapshot.plan = "Max"
+    record = reading_record(snapshot)
+    assert record == {"plan": "Max", "windows": [{"label": "Current session", "used_percent": 20.0, "reset_at": NOW + 3600}]}
+    assert json.loads(json.dumps(record)) == record
+    assert _account(record)["windows"][0]["used_percent"] == 20.0
+    for empty in (None, ValueError("x"), _Snapshot([])):
+        assert reading_record(empty) is None
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     for name, value in globals().items():
