@@ -1661,6 +1661,44 @@ def test_a_held_reading_and_backoff_do_not_carry_over_to_another_login_on_the_sa
     assert stored["reading"] is None and stored["fingerprint"] == plugin_api._token_fingerprint("token-new")
 
 
+def _merge(rows):
+    order = [row["entry_id"] for row in rows]
+    accounts = {row["entry_id"]: {"account_email": "same@example.com", **row} for row in rows}
+    active = {entry_id: False for entry_id in order}
+    merged = plugin_api._merge_same_account(order, accounts, active)
+    assert len(merged) == 1
+    return accounts[merged[0]]
+
+
+def test_merging_keeps_the_newest_reading_of_equal_rank():
+    for rows in (
+        [{"entry_id": "old", "source": _usage_snapshot(10), "read_at": NOW - 3500},
+         {"entry_id": "new", "source": _usage_snapshot(95), "read_at": NOW - 200}],
+        [{"entry_id": "new", "source": _usage_snapshot(95), "read_at": NOW - 200},
+         {"entry_id": "old", "source": _usage_snapshot(10), "read_at": NOW - 3500}],
+    ):
+        assert _merge(rows)["entry_id"] == "new"
+
+
+def test_merging_keeps_a_newer_bench_from_another_entry():
+    until = NOW + 2 * 86_400
+    row = _merge([
+        {"entry_id": "read", "source": _usage_snapshot(10), "stale_since": NOW - 3600, "read_at": NOW - 3600},
+        {"entry_id": "benched", "source": None, "exhausted_until": until, "benched_at": NOW - 600},
+    ])
+    assert row["entry_id"] == "read" and row["exhausted_until"] == until and row["benched_at"] == NOW - 600
+    account = plugin_api.build_quotas_response({"anthropic": {"pool_size": 2, "accounts": [row]}}, now=NOW)["providers"][0]["accounts"][0]
+    assert account["status"] == "exhausted" and account["estimated"] is True
+
+    # A reading taken after the bench still wins over it.
+    later = _merge([
+        {"entry_id": "read", "source": _usage_snapshot(10), "read_at": NOW - 60},
+        {"entry_id": "benched", "source": None, "exhausted_until": until, "benched_at": NOW - 600},
+    ])
+    account = plugin_api.build_quotas_response({"anthropic": {"pool_size": 2, "accounts": [later]}}, now=NOW)["providers"][0]["accounts"][0]
+    assert account["status"] == "ok" and "estimated" not in account
+
+
 def test_pool_entries_signed_in_to_one_account_show_as_one_row():
     root = Path("/tmp/hermes-root")
     entries = [_pool_entry("id-a", "first", "token-a", 0), _pool_entry("id-b", "second", "token-b", 1),

@@ -1088,21 +1088,15 @@ def _snapshot_pool_for_profile(
         _reset_secret_scope(secret_token)
 
 
-def _reading_rank(account: dict[str, Any]) -> int:
-    """How much an account row knows: a current reading, a held one, a bench, nothing."""
-    if account.get("source") is not None:
-        return 0 if account.get("stale_since") is None else 1
-    return 2 if account.get("exhausted_until") is not None else 3
-
-
 def _merge_same_account(
     order: list[str], accounts_by_id: dict[str, dict[str, Any]], entry_active: dict[str, bool]
 ) -> list[str]:
     """Collapse pool entries signed in to one account (same email) into one row.
 
     Two entries of one login report one quota, so listing both shows an account twice. The row
-    kept is the one that knows the most (``_reading_rank``, then pool order); it is active when any
-    of its entries is, and carries how many entries it stands for. Rows without an email stay.
+    kept is the one with the newest reading (then pool order) and takes the newest bench of any
+    entry; it is active when any of its entries is, and carries how many entries it stands for.
+    Rows without an email stay.
     """
     groups: dict[str, list[str]] = {}
     for entry_id in order:
@@ -1119,8 +1113,16 @@ def _merge_same_account(
         if entry_id != group[0]:
             continue  # the group's row is placed where its first entry was
         members = group
-        kept = min(members, key=lambda member: (_reading_rank(accounts_by_id[member]), members.index(member)))
-        accounts_by_id[kept] = {**accounts_by_id[kept], "pool_entries": len(members)}
+        kept = min(members, key=lambda member: (-(accounts_by_id[member].get("read_at") or 0.0), members.index(member)))
+        row = {**accounts_by_id[kept], "pool_entries": len(members)}
+        # A bench on any entry is the account's: carry the newest one so the transform can still
+        # weigh it against the kept reading's time.
+        benches = [accounts_by_id[m] for m in members if accounts_by_id[m].get("exhausted_until") is not None]
+        if benches:
+            bench = max(benches, key=lambda account: account.get("benched_at") or 0.0)
+            if row.get("exhausted_until") is None or (bench.get("benched_at") or 0.0) > (row.get("benched_at") or 0.0):
+                row["exhausted_until"], row["benched_at"] = bench["exhausted_until"], bench.get("benched_at")
+        accounts_by_id[kept] = row
         entry_active[kept] = any(entry_active[member] for member in members)
         merged.append(kept)
     return merged
