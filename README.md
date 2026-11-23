@@ -26,7 +26,7 @@ Kanban workers can stall or loop without telling you, and a quota window can run
 
 - **Worker health at a glance.** A spinner and the number of running Kanban cards, coloured by the worst state: active, stalled or looping.
 - **Stall and loop detection.** Stalls follow the Kanban board's own heartbeat threshold; a loop is the same tool call with the same arguments, repeated.
-- **Quotas for every account you have.** Claude and Codex usage windows, DeepSeek balance, and any other provider Hermes can read usage for, across every Hermes profile.
+- **Quotas for every pooled account.** Claude and Codex usage windows and any other provider Hermes can read usage for, across every Hermes profile, plus the balance of one DeepSeek key.
 - **Pace.** See whether you are ahead of an even burn rate, and when a window will run out at the current rate.
 - **Honest figures.** Each row says whether it was read just now, held from an earlier read (`cached`) or estimated from a recorded limit; anything the monitor cannot tell reads `n/a`.
 - **Read-only by design.** A quota read never refreshes or writes a credential, and no message content or tool arguments reach the UI.
@@ -92,7 +92,7 @@ The footer takes the worst state across running cards: loop, then stalled, then 
 Providers are discovered from Hermes itself: every provider Hermes can read account usage for (Claude and Codex are built in, plus any provider that exposes a usage reader) and DeepSeek when a `DEEPSEEK_API_KEY` is found. Providers without a credential are hidden and local-only providers are skipped. A provider whose read fails stays listed with `n/a`.
 
 - **Claude** shows its five-hour (`5h`) and weekly (`week`) windows. **Codex** shows the windows it returns (`Session`, `Weekly`). Each window has a used percentage and a reset time; reset times outside today include the date (`MM/DD HH:MM`).
-- **DeepSeek** shows the remaining balance. Its key is resolved from the process environment, then the Hermes root `.env`, then the first profile `.env` (alphabetical) that contains `DEEPSEEK_API_KEY`.
+- **DeepSeek** shows the remaining balance. Its key is resolved from the process environment, then the Hermes root `.env`, then the first profile `.env` (alphabetical) that contains `DEEPSEEK_API_KEY`. Only that one key is read: DeepSeek is not a pooled provider, so other profiles' DeepSeek keys are not shown.
 
 #### Pace
 
@@ -128,9 +128,11 @@ An exhausted Claude or Codex account keeps its five-hour and weekly rows: the li
 
 The refresh button skips the two-minute interval but not the backoff after a failed read, and rests for 30 seconds after each click, because usage endpoints answer bursts with rate limits that hold for minutes.
 
+The per-account interval and backoff apply to pooled accounts only. The DeepSeek balance is requested again whenever the quota payload is rebuilt: at most once per 60-second poll, plus each time the Quotas menu is opened or refreshed.
+
 ## Privacy and security
 
-**Workers.** The backend opens the local Kanban board and worker session databases read-only and never creates or writes a file next to them. Only activity metadata is returned: message content and tool arguments never reach the Desktop plugin, and arguments are reduced to hashes for loop detection.
+**Workers.** The backend opens the local Kanban board and worker session databases read-only and never writes to them. SQLite may still leave its own empty `-wal` sidecar file next to a database it opens; the database contents are not changed. Only activity metadata is returned: message content and tool arguments never reach the Desktop plugin, and arguments are reduced to hashes for loop detection.
 
 **Credentials.** To aggregate quotas, the backend reads every profile's credential store (`auth.json`) one profile at a time into immutable snapshots and issues only usage requests against them. Quota reads never refresh, mutate or persist a credential, and no secret from one profile is copied into another. An expired token is skipped, not refreshed. Hermes core itself may still refresh the active profile's Anthropic token near expiry, or a Codex token after an HTTP 401, rewriting only that profile's `auth.json`. Credentials stay in the backend and are never returned to the Desktop plugin.
 
@@ -151,7 +153,13 @@ The borrowed Claude Code login's email is read locally from Claude Code's own co
 
 Each stored entry carries a truncated SHA-256 of the token it was read with, never the token itself. When a pool entry signs in to another account, its stored email, reading and backoff are dropped and read again. Entries removed from every pool are dropped from the email file on the next collection that reads all pools.
 
-**What reaches the UI.** No profile names, absolute paths, tokens or other personal data are sent to the Desktop plugin, with one exception: each Claude account's sign-in email, shown in the Quotas menu only and sent nowhere else.
+**What reaches the UI.** Tokens, keys and absolute paths are never sent to the Desktop plugin. It does receive, and shows in its menus:
+
+- each running card's title, card id and assignee, as written on the Kanban board;
+- the name of the Hermes profile each account comes from, and for DeepSeek the name of the place its key was read from (`env`, `root` or a profile name);
+- each Claude account's sign-in email.
+
+These stay on your machine: the plugin sends them nowhere else.
 
 ## Troubleshooting
 
